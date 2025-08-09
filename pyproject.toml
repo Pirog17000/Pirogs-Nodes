@@ -1,0 +1,22 @@
+[project]
+name = "pirogs-nodes"
+version = "1.0.0"
+description = "Pirog's Nodes - ComfyUI custom node pack providing enhanced sampling functionality"
+authors = [
+    {name = "pirog", email = "pirog@example.com"}
+]
+readme = "README.md"
+license = {file = "LICENSE"}
+keywords = ["comfyui", "sampling", "multi-seed", "stable-diffusion", "pirog"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+[project.optional-dependencies]
+dev = ["black", "flake8", "pytest"]
