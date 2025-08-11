@@ -1289,3 +1289,317 @@ class TestResetButton:
     def get_value(self, test_value):
         """Returns the test value as output"""
         return (test_value,)
+
+
+class LensSimulatedBloom:
+    """
+    Lens-simulated Bloom Node
+    
+    Applies a high-quality, hybrid bloom effect to input images using a combination of
+    multi-pass downsampling blur (haze) and FFT convolution with custom kernels (spikes).
+    This creates realistic camera lens bloom effects with soft atmospheric glow and 
+    sharp structured diffraction artifacts.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {
+                    "tooltip": "Input image to apply lens-simulated bloom effect"
+                }),
+                "psf_kernel": ("IMAGE", {
+                    "tooltip": "Point Spread Function kernel defining diffraction spike shape (grayscale recommended)"
+                }),
+                "threshold": ("FLOAT", {
+                    "default": 0.85,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Base brightness threshold (0.0-1.0). With progressive_threshold enabled, this is the starting threshold that increases each pass up to 1.0"
+                }),
+                "haze_passes": ("INT", {
+                    "default": 6,
+                    "min": 1,
+                    "max": 12,
+                    "step": 1,
+                    "tooltip": "Number of downsampling/blurring passes for soft haze effect"
+                }),
+                "haze_spread": ("FLOAT", {
+                    "default": 2.0,
+                    "min": 0.1,
+                    "max": 10.0,
+                    "step": 0.1,
+                    "tooltip": "Gaussian blur sigma for haze passes - controls haze softness"
+                }),
+                "haze_intensity": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.01,
+                    "tooltip": "Multiplier for soft haze brightness (normalized, safe range 0.1-3.0)"
+                }),
+                "spike_intensity": ("FLOAT", {
+                    "default": 1.5,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.01,
+                    "tooltip": "Multiplier for structured spike brightness (normalized, safe range 0.1-5.0)"
+                }),
+                "progressive_threshold": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Enable progressive threshold: each haze pass uses higher threshold for finer detail isolation"
+                })
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_TOOLTIPS = ("Image with lens-simulated bloom effect applied",)
+    FUNCTION = "apply_bloom"
+    CATEGORY = "pirog/image"
+    DESCRIPTION = "Applies realistic lens bloom using hybrid approach: multi-pass blur for soft haze + FFT convolution for sharp spikes. Requires NumPy, OpenCV, and SciPy."
+
+    def apply_bloom(self, image, psf_kernel, threshold, haze_passes, haze_spread, haze_intensity, spike_intensity, progressive_threshold=True):
+        """Apply the hybrid bloom effect to input images"""
+        try:
+            # Import required libraries
+            import cv2
+            
+            # Convert ComfyUI tensors to numpy arrays
+            img_np = self.tensor_to_numpy(image)
+            kernel_np = self.tensor_to_numpy(psf_kernel)
+            
+            # Process each image in the batch
+            batch_size = img_np.shape[0]
+            output_images = []
+            
+            for i in range(batch_size):
+                # Get single image and convert to proper format
+                single_img = img_np[i]
+                
+                # Use first kernel image or cycle through if multiple kernels
+                kernel_idx = min(i, kernel_np.shape[0] - 1)
+                single_kernel = kernel_np[kernel_idx]
+                
+                # Convert kernel to grayscale if it's color
+                if len(single_kernel.shape) == 3:
+                    single_kernel = cv2.cvtColor(single_kernel, cv2.COLOR_RGB2GRAY)
+                
+                # Apply the hybrid bloom effect
+                bloom_result = self.apply_hybrid_bloom(
+                    single_img,
+                    single_kernel,
+                    threshold,
+                    haze_passes,
+                    haze_spread,
+                    haze_intensity,
+                    spike_intensity,
+                    progressive_threshold
+                )
+                
+                output_images.append(bloom_result)
+            
+            # Stack results and convert back to tensor
+            result_array = np.stack(output_images, axis=0)
+            result_tensor = self.numpy_to_tensor(result_array)
+            
+            return (result_tensor,)
+            
+        except ImportError as e:
+            raise RuntimeError(f"Missing required library for Lens-simulated Bloom: {e}. Please install numpy, opencv-python, and scipy.")
+        except Exception as e:
+            raise RuntimeError(f"Error applying lens bloom: {e}")
+
+    def apply_hybrid_bloom(self, image, psf_kernel, threshold=0.85, haze_passes=6, 
+                          haze_spread=2.0, haze_intensity=1.0, spike_intensity=1.5, progressive_threshold=True):
+        """
+        Applies a high-quality, hybrid bloom effect to an input image.
+
+        This method combines two techniques for a visually superior result:
+        1.  A multi-pass, downsampling blur (the "Haze") for a soft, atmospheric glow.
+            Progressive threshold mode creates realistic gradation from general to specific highlights
+        2.  An FFT convolution with a custom kernel (the "Spikes") for sharp,
+            structured diffraction artifacts like starbursts or anamorphic streaks.
+            
+        Args:
+            progressive_threshold (bool): When True, each haze pass uses progressively higher 
+                threshold values (e.g., 0.2 → 0.36 → 0.52 → ... → 1.0), creating more 
+                realistic bloom with fine gradation. When False, uses original single-threshold method.
+        """
+        import numpy as np
+        import cv2
+        from scipy.signal import fftconvolve
+
+        # --- 1. PRE-PROCESSING AND BRIGHTNESS EXTRACTION ---
+
+        # Ensure image is in a floating-point format (0.0 to 1.0) for calculations
+        if image.dtype == np.uint8:
+            image_float = image.astype(np.float32) / 255.0
+        else:
+            image_float = image.copy()
+
+        # Create a brightness map. For color images, convert to grayscale.
+        # The brightness map determines which pixels are bright enough to "bloom".
+        if len(image_float.shape) == 3:
+            brightness_map = cv2.cvtColor(image_float, cv2.COLOR_RGB2GRAY)
+        else:
+            brightness_map = image_float
+
+        # --- 2. HAZE GENERATION (PROGRESSIVE THRESHOLD MULTI-PASS BLUR) ---
+
+        if progressive_threshold:
+            # Progressive threshold mode: each pass uses increasingly higher threshold
+            # This creates more realistic bloom with fine gradation from general to specific highlights
+            
+            # Calculate threshold progression from base threshold to 1.0
+            if haze_passes > 1:
+                threshold_step = (1.0 - threshold) / (haze_passes - 1)
+                thresholds = [threshold + i * threshold_step for i in range(haze_passes)]
+            else:
+                thresholds = [threshold]
+            
+            # Create haze layers with progressive thresholds
+            haze_layers = []
+            for pass_idx in range(haze_passes):
+                current_threshold = thresholds[pass_idx]
+                
+                # Threshold the brightness map for this pass
+                _, brights_mask = cv2.threshold(brightness_map, current_threshold, 1.0, cv2.THRESH_BINARY)
+                
+                # Create bright pixels for this threshold level
+                if len(image_float.shape) == 3:
+                    brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
+                    bright_pixels_pass = image_float * brights_mask_3ch
+                else:
+                    bright_pixels_pass = brights_mask
+                
+                # Downsample for pyramid effect
+                current_layer = bright_pixels_pass
+                for _ in range(pass_idx):
+                    current_layer = cv2.pyrDown(current_layer)
+                
+                haze_layers.append(current_layer)
+            
+            # Blur each threshold layer with appropriate scaling
+            blurred_layers = [cv2.GaussianBlur(layer, (0, 0), haze_spread) for layer in haze_layers]
+            
+            # Composite progressive threshold layers
+            haze_composite = None
+            for i, layer in enumerate(blurred_layers):
+                # Upsample to original size using safer approach
+                upsampled = layer
+                
+                # Instead of forcing pyrUp to exact dimensions, use step-by-step upsampling
+                # then resize to exact dimensions at the end
+                for _ in range(i):
+                    # Use pyrUp without forcing exact dimensions
+                    upsampled = cv2.pyrUp(upsampled)
+                
+                # Now safely resize to exact original dimensions
+                if upsampled.shape[:2] != image_float.shape[:2]:
+                    upsampled = cv2.resize(upsampled, (image_float.shape[1], image_float.shape[0]))
+                
+                if haze_composite is None:
+                    haze_composite = upsampled
+                else:
+                    haze_composite += upsampled
+            
+        else:
+            # Original single-threshold mode for compatibility
+            _, brights_mask = cv2.threshold(brightness_map, threshold, 1.0, cv2.THRESH_BINARY)
+            
+            if len(image_float.shape) == 3:
+                brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
+                bright_pixels = image_float * brights_mask_3ch
+            else:
+                bright_pixels = brights_mask
+            
+            haze_layers = [bright_pixels]
+            current_layer = bright_pixels
+            
+            # Create a pyramid of downsampled images
+            for _ in range(haze_passes - 1):
+                current_layer = cv2.pyrDown(current_layer)
+                haze_layers.append(current_layer)
+            
+            # Blur each layer in the pyramid
+            blurred_layers = [cv2.GaussianBlur(layer, (0, 0), haze_spread) for layer in haze_layers]
+            
+            # Composite the blurred layers back together
+            haze_composite = blurred_layers[-1]
+            for i in range(haze_passes - 2, -1, -1):
+                # Use pyrUp without forcing exact dimensions, then resize if needed
+                haze_composite = cv2.pyrUp(haze_composite)
+                
+                # Ensure dimensions match the target layer
+                if haze_composite.shape[:2] != blurred_layers[i].shape[:2]:
+                    haze_composite = cv2.resize(haze_composite, (blurred_layers[i].shape[1], blurred_layers[i].shape[0]))
+                
+                haze_composite += blurred_layers[i]
+        
+        # Normalize by the number of layers to prevent brightness accumulation
+        # This ensures haze_intensity behaves predictably regardless of haze_passes
+        haze_composite = haze_composite / haze_passes
+
+        # For spike generation, use the original threshold method to maintain compatibility
+        _, brights_mask = cv2.threshold(brightness_map, threshold, 1.0, cv2.THRESH_BINARY)
+        if len(image_float.shape) == 3:
+            brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
+            bright_pixels = image_float * brights_mask_3ch
+        else:
+            bright_pixels = brights_mask
+
+        # --- 3. SPIKE GENERATION (FFT CONVOLUTION) ---
+
+        # Normalize the PSF kernel to prevent value explosion during convolution
+        # This ensures the convolution output stays in a reasonable range
+        psf_normalized = psf_kernel / np.sum(psf_kernel) if np.sum(psf_kernel) > 0 else psf_kernel
+
+        # Convolve the bright pixels with the custom PSF kernel using FFT for efficiency
+        # and accuracy. This creates the structured light spikes.
+        if len(image_float.shape) == 3:
+            spike_layer = np.zeros_like(image_float)
+            # Perform convolution on each color channel separately
+            for i in range(3):
+                spike_layer[:, :, i] = fftconvolve(bright_pixels[:, :, i], psf_normalized, mode='same')
+        else:
+            spike_layer = fftconvolve(bright_pixels, psf_normalized, mode='same')
+
+        # --- 4. FINAL COMPOSITION ---
+
+        # Combine the original image, the soft haze, and the sharp spikes.
+        # The intensities are used to control the final look.
+        bloom_image = (
+            image_float +
+            (haze_composite * haze_intensity) +
+            (spike_layer * spike_intensity)
+        )
+
+        # Clip the result to the valid [0.0, 1.0] range to prevent wrapping artifacts
+        bloom_image = np.clip(bloom_image, 0.0, 1.0)
+
+        # Convert back to uint8 format for standard image display/saving
+        return (bloom_image * 255).astype(np.uint8)
+
+    def tensor_to_numpy(self, tensor):
+        """Convert ComfyUI image tensor to numpy array"""
+        # ComfyUI tensors are in format [batch, height, width, channels]
+        # Convert to uint8 if in float format
+        if tensor.dtype == torch.float32 or tensor.dtype == torch.float64:
+            # Clamp to [0,1] and convert to [0,255]
+            numpy_array = (torch.clamp(tensor, 0, 1) * 255).byte().cpu().numpy()
+        else:
+            numpy_array = tensor.cpu().numpy()
+        
+        return numpy_array
+
+    def numpy_to_tensor(self, numpy_array):
+        """Convert numpy array to ComfyUI image tensor"""
+        # Ensure array is in uint8 format
+        if numpy_array.dtype != np.uint8:
+            numpy_array = np.clip(numpy_array, 0, 255).astype(np.uint8)
+        
+        # Convert to float32 and normalize to [0,1]
+        tensor = torch.from_numpy(numpy_array.astype(np.float32) / 255.0)
+        
+        return tensor

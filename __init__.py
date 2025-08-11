@@ -1,4 +1,4 @@
-from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton
+from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom
 
 NODE_CLASS_MAPPINGS = {
     "KSamplerMultiSeed": KSamplerMultiSeed,
@@ -8,7 +8,8 @@ NODE_CLASS_MAPPINGS = {
     "ImageScalePro": ImageScalePro,
     "PromptRandomizer": PromptRandomizer,
     "DSLRNoise": DSLRNoise,
-    "TestResetButton": TestResetButton
+    "TestResetButton": TestResetButton,
+    "LensSimulatedBloom": LensSimulatedBloom
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -19,7 +20,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageScalePro": "Proportional Image Scaling",
     "PromptRandomizer": "Prompt Randomizer",
     "DSLRNoise": "DSLR Camera Noise",
-    "TestResetButton": "Test Reset Button"
+    "TestResetButton": "Test Reset Button",
+    "LensSimulatedBloom": "Lens-simulated Bloom"
 }
 
 WEB_DIRECTORY = "./js"
