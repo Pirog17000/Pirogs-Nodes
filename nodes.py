@@ -1603,3 +1603,593 @@ class LensSimulatedBloom:
         tensor = torch.from_numpy(numpy_array.astype(np.float32) / 255.0)
         
         return tensor
+
+
+# ====================================
+# CROP-UNCROP NODES INTEGRATION
+# ====================================
+
+class CropImage:
+    """
+    Crops images from specified sides (left, right, top, bottom)
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "left": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+                "right": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+                "top": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+                "bottom": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "crop"
+    CATEGORY = "pirog/image"
+
+    def crop(self, images, left, right, top, bottom):
+        result_images = []
+        
+        for img in images:
+            height, width = img.shape[:2]
+            
+            # Calculate remaining dimensions after cropping
+            new_width = width - left - right
+            new_height = height - top - bottom
+            
+            # Ensure dimensions don't become negative
+            if new_width <= 0 or new_height <= 0:
+                logging.warning(f"Crop values too large for image size {width}x{height}")
+                result_images.append(img)
+                continue
+                
+            # Crop image sequentially
+            result = img
+            if left > 0:
+                result = result[:, left:]
+            if right > 0:
+                result = result[:, :-right]
+            if top > 0:
+                result = result[top:]
+            if bottom > 0:
+                result = result[:-bottom]
+                
+            result_images.append(result)
+            
+        return (torch.stack(result_images),)
+
+
+class BatchCropFromMaskSimple:
+    """
+    Crops images based on mask boundaries with expansion
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "masks": ("MASK",),
+                "expansion": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "BBOX")
+    RETURN_NAMES = ("cropped_images", "bboxes")
+    FUNCTION = "crop"
+    CATEGORY = "pirog/image"
+
+    def get_bbox_from_mask(self, mask_tensor, expansion):
+        mask = (mask_tensor > 0.5).cpu().numpy()
+        y_indices, x_indices = np.nonzero(mask)
+        
+        if len(x_indices) == 0 or len(y_indices) == 0:
+            return None
+            
+        min_x = max(0, np.min(x_indices) - expansion)
+        max_x = min(mask.shape[1], np.max(x_indices) + expansion)
+        min_y = max(0, np.min(y_indices) - expansion)
+        max_y = min(mask.shape[0], np.max(y_indices) + expansion)
+        
+        return (min_x, min_y, max_x - min_x, max_y - min_y)
+
+    def crop(self, images, masks, expansion):
+        bboxes = []
+        cropped_images = []
+
+        for img, mask in zip(images, masks):
+            bbox = self.get_bbox_from_mask(mask, expansion)
+            if bbox is None:
+                continue
+                
+            min_x, min_y, width, height = bbox
+            cropped = img[min_y:min_y+height, min_x:min_x+width]
+            cropped_images.append(cropped)
+            bboxes.append(bbox)
+
+        if not cropped_images:
+            return (images, [(0, 0, images[0].shape[1], images[0].shape[0])])
+
+        return (torch.stack(cropped_images), bboxes)
+
+
+class BatchUncropSimple:
+    """
+    Uncrops images back to their original size with blending
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "original_images": ("IMAGE",),
+                "cropped_images": ("IMAGE",),
+                "bboxes": ("BBOX",),
+                "blend_width": ("INT", {"default": 16, "min": 0, "max": 256, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "uncrop"
+    CATEGORY = "pirog/image"
+
+    def create_blend_mask(self, size, blend_width):
+        mask = np.ones(size)
+        if blend_width > 0:
+            for i in range(blend_width):
+                alpha = i / blend_width
+                mask[:, i] *= alpha
+                mask[:, -(i+1)] *= alpha
+                mask[i, :] *= alpha
+                mask[-(i+1), :] *= alpha
+        return torch.from_numpy(mask).float()
+
+    def uncrop(self, original_images, cropped_images, bboxes, blend_width):
+        num_outputs = max(len(original_images), len(cropped_images))
+        result_images = []
+        device = original_images.device
+
+        for i in range(num_outputs):
+            # Get original image (cycle if needed)
+            orig_img = original_images[i % len(original_images)].clone()
+            # Get cropped image and bbox
+            crop_img = cropped_images[i % len(cropped_images)]
+            bbox = bboxes[i % len(bboxes)]
+
+            x, y, w, h = bbox
+            blend_mask = self.create_blend_mask((h, w), blend_width).to(device)
+            
+            for c in range(3):
+                orig_img[y:y+h, x:x+w, c] = (
+                    crop_img[:h, :w, c] * blend_mask + 
+                    orig_img[y:y+h, x:x+w, c] * (1 - blend_mask)
+                )
+            
+            result_images.append(orig_img)
+
+        return (torch.stack(result_images),)
+
+
+class CropMaskByBBox:
+    """
+    Crops masks using bounding box coordinates
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "masks": ("MASK",),
+                "bboxes": ("BBOX",),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "crop"
+    CATEGORY = "pirog/image"
+
+    def crop(self, masks, bboxes):
+        cropped_masks = []
+
+        for mask, bbox in zip(masks, bboxes):
+            x, y, width, height = bbox
+            
+            # Crop the mask using bbox coordinates
+            cropped = mask[y:y+height, x:x+width]
+            cropped_masks.append(cropped)
+
+        # Stack the cropped masks
+        return (torch.stack(cropped_masks),)
+
+
+# ====================================
+# MASK PROCESSING NODES
+# ====================================
+
+class BlurMask:
+    """
+    Blurs masks with smart edge handling to prevent feathering at image boundaries
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "blur_radius": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "tapered_corners": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "blur_mask"
+    CATEGORY = "pirog/mask"
+
+    def blur_mask(self, mask, blur_radius, tapered_corners):
+        if blur_radius == 0:
+            return (mask,)
+        
+        # Convert mask to numpy for processing
+        mask_np = mask.cpu().numpy()
+        batch_size = mask_np.shape[0]
+        
+        result_masks = []
+        
+        for i in range(batch_size):
+            current_mask = mask_np[i]
+            height, width = current_mask.shape
+            
+            if tapered_corners:
+                # Create a distance map from image boundaries
+                # This identifies how far each pixel is from the nearest image edge
+                y_coords, x_coords = np.mgrid[:height, :width]
+                
+                # Distance from each edge
+                dist_from_top = y_coords.astype(np.float32)
+                dist_from_bottom = (height - 1 - y_coords).astype(np.float32)
+                dist_from_left = x_coords.astype(np.float32)
+                dist_from_right = (width - 1 - x_coords).astype(np.float32)
+                
+                # Minimum distance to any edge - using stacking and min for compatibility
+                edge_distance = np.minimum(
+                    np.minimum(dist_from_top, dist_from_bottom),
+                    np.minimum(dist_from_left, dist_from_right)
+                )
+                
+                # Calculate blur protection zone
+                # Pixels within blur_radius distance from edge get protection
+                protection_radius = max(1, int(blur_radius * 2))
+                boundary_mask = edge_distance < protection_radius
+                
+                if np.any(boundary_mask):
+                    # For pixels near boundaries, use reflection padding to prevent feathering
+                    from scipy.ndimage import gaussian_filter
+                    blurred_reflected = gaussian_filter(current_mask, sigma=blur_radius, mode='reflect')
+                    
+                    # For interior pixels, use normal blur
+                    blurred_normal = gaussian_filter(current_mask, sigma=blur_radius, mode='constant')
+                    
+                    # Create smooth transition between boundary and interior regions
+                    # Distance-based blending with smooth falloff
+                    normalized_distance = np.clip(edge_distance / protection_radius, 0, 1)
+                    # Use smoothstep function for natural transition
+                    blend_factor = normalized_distance * normalized_distance * (3 - 2 * normalized_distance)
+                    
+                    # Blend: near boundaries use reflected blur, far from boundaries use normal blur
+                    result = blurred_reflected * (1 - blend_factor) + blurred_normal * blend_factor
+                else:
+                    # If no pixels are near boundaries, just use normal blur
+                    from scipy.ndimage import gaussian_filter
+                    result = gaussian_filter(current_mask, sigma=blur_radius, mode='constant')
+            else:
+                # Simple gaussian blur without edge protection
+                from scipy.ndimage import gaussian_filter
+                result = gaussian_filter(current_mask, sigma=blur_radius, mode='constant')
+            
+            result_masks.append(torch.from_numpy(result))
+        
+        return (torch.stack(result_masks),)
+
+
+class InvertMask:
+    """
+    Inverts mask values (0 becomes 1, 1 becomes 0)
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "invert_mask"
+    CATEGORY = "pirog/mask"
+
+    def invert_mask(self, mask):
+        return (1.0 - mask,)
+
+
+class GradientMaskGenerator:
+    """
+    Generates linear gradient masks with directional control, balance, and contrast adjustment
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 512, "min": 1, "max": 4096, "step": 1}),
+                "height": ("INT", {"default": 512, "min": 1, "max": 4096, "step": 1}),
+                "direction": (["left_to_right", "right_to_left", "top_to_bottom", "bottom_to_top"], {"default": "left_to_right"}),
+                "balance": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01}),
+                "contrast": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "soften": ("FLOAT", {"default": 30.0, "min": 0.0, "max": 50.0, "step": 0.1}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "generate_gradient"
+    CATEGORY = "pirog/mask"
+
+    def generate_gradient(self, width, height, direction, balance, contrast, soften):
+        # Create base coordinate array (0 to 1)
+        if direction == "left_to_right":
+            coords = np.linspace(0, 1, width, dtype=np.float32)
+            mask = np.tile(coords, (height, 1))
+        elif direction == "right_to_left":
+            coords = np.linspace(1, 0, width, dtype=np.float32)
+            mask = np.tile(coords, (height, 1))
+        elif direction == "top_to_bottom":
+            coords = np.linspace(0, 1, height, dtype=np.float32)
+            mask = np.tile(coords.reshape(-1, 1), (1, width))
+        elif direction == "bottom_to_top":
+            coords = np.linspace(1, 0, height, dtype=np.float32)
+            mask = np.tile(coords.reshape(-1, 1), (1, width))
+        
+        # Apply balance adjustment - shift the midpoint (0.5 gray) position
+        if balance != 0.5:
+            # Create piecewise linear gradient with shifted midpoint
+            # balance determines where the 0.5 gray value appears in the gradient
+            
+            # For each pixel position, calculate what the gradient value should be
+            mask_balanced = np.zeros_like(mask)
+            
+            # First segment: 0 to balance position maps to 0.0 to 0.5
+            first_segment = mask <= balance
+            if np.any(first_segment):
+                # Linear interpolation from 0 to 0.5 over 0 to balance range
+                mask_balanced[first_segment] = 0.5 * (mask[first_segment] / balance)
+            
+            # Second segment: balance to 1.0 position maps to 0.5 to 1.0  
+            second_segment = mask > balance
+            if np.any(second_segment):
+                # Linear interpolation from 0.5 to 1.0 over balance to 1.0 range
+                mask_balanced[second_segment] = 0.5 + 0.5 * ((mask[second_segment] - balance) / (1.0 - balance))
+            
+            mask = mask_balanced
+        
+        # Apply contrast adjustment - expand around 0.5 midpoint toward black/white
+        if contrast > 0:
+            # Contrast pushes values away from 0.5 toward 0.0 and 1.0
+            # Higher contrast = more separation, sharper transitions
+            
+            # Calculate distance from midpoint (0.5)
+            distance_from_mid = np.abs(mask - 0.5)
+            
+            # Determine which side of midpoint each pixel is on
+            above_mid = mask >= 0.5
+            below_mid = mask < 0.5
+            
+            # Apply contrast expansion
+            # contrast=0: no change, contrast=1: maximum separation
+            expanded_distance = distance_from_mid + contrast * (0.5 - distance_from_mid)
+            
+            # Reconstruct values on correct side of midpoint
+            mask = np.where(above_mid, 
+                          0.5 + expanded_distance,  # Above midpoint: push toward 1.0
+                          0.5 - expanded_distance)  # Below midpoint: push toward 0.0
+            
+            # Ensure we stay in valid range
+            mask = np.clip(mask, 0.0, 1.0)
+        
+        # Apply directional softening (blur along gradient direction only)
+        if soften > 0:
+            mask = self.apply_directional_blur(mask, direction, soften)
+        
+        # Convert to tensor and add batch dimension
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
+        
+        return (mask_tensor,)
+
+    def apply_directional_blur(self, mask, direction, sigma):
+        """
+        Apply 1D Gaussian blur only along the gradient direction to soften transitions
+        without bleeding to perpendicular sides
+        """
+        if sigma <= 0:
+            return mask
+            
+        # Calculate kernel size (should be odd)
+        kernel_size = int(sigma * 6 + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        # Create 1D Gaussian kernel
+        kernel_1d = np.exp(-0.5 * (np.arange(kernel_size) - kernel_size // 2) ** 2 / sigma ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Apply directional blur based on gradient direction
+        if direction in ["left_to_right", "right_to_left"]:
+            # Horizontal gradient - blur horizontally only
+            # Apply 1D convolution along axis=1 (width/horizontal)
+            from scipy.ndimage import convolve1d
+            blurred = convolve1d(mask, kernel_1d, axis=1, mode='reflect')
+        else:  # top_to_bottom or bottom_to_top
+            # Vertical gradient - blur vertically only  
+            # Apply 1D convolution along axis=0 (height/vertical)
+            from scipy.ndimage import convolve1d
+            blurred = convolve1d(mask, kernel_1d, axis=0, mode='reflect')
+            
+        return blurred
+
+
+# ====================================
+# IMAGE PROCESSING WITH MASKS
+# ====================================
+
+class ImageBlendByMask:
+    """
+    Blends two images using a mask to control the blend regions and amount
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_image": ("IMAGE",),
+                "target_image": ("IMAGE",),
+                "mask": ("MASK",),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+                "blend_amount": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "blend_images"
+    CATEGORY = "pirog/image"
+
+    def blend_images(self, source_image, target_image, mask, invert_mask, blend_amount):
+        # Ensure all inputs are on the same device
+        device = source_image.device
+        target_image = target_image.to(device)
+        mask = mask.to(device)
+        
+        # Handle batch dimensions - use the smallest batch size
+        batch_size = min(source_image.shape[0], target_image.shape[0], mask.shape[0])
+        
+        # Crop to matching batch size
+        source_batch = source_image[:batch_size]
+        target_batch = target_image[:batch_size]
+        mask_batch = mask[:batch_size]
+        
+        # Resize images to match if they have different dimensions
+        if source_batch.shape[1:3] != target_batch.shape[1:3]:
+            # Resize target to match source dimensions
+            target_batch = torch.nn.functional.interpolate(
+                target_batch.permute(0, 3, 1, 2), 
+                size=(source_batch.shape[1], source_batch.shape[2]), 
+                mode='bilinear', 
+                align_corners=False
+            ).permute(0, 2, 3, 1)
+        
+        # Resize mask to match image dimensions if needed
+        if mask_batch.shape[1:3] != source_batch.shape[1:3]:
+            mask_batch = torch.nn.functional.interpolate(
+                mask_batch.unsqueeze(1), 
+                size=(source_batch.shape[1], source_batch.shape[2]), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(1)
+        
+        # Expand mask to match image channels (add channel dimension)
+        mask_expanded = mask_batch.unsqueeze(-1).expand(-1, -1, -1, source_batch.shape[-1])
+        
+        # Invert mask if requested
+        if invert_mask:
+            mask_expanded = 1.0 - mask_expanded
+        
+        # Apply blend amount to mask
+        blend_mask = mask_expanded * blend_amount
+        
+        # Perform the blend: result = source * (1 - blend_mask) + target * blend_mask
+        result = source_batch * (1.0 - blend_mask) + target_batch * blend_mask
+        
+        return (result,)
+
+
+class BlurByMask:
+    """
+    Applies selective blur to an image based on mask values
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+                "blur_amount": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 50.0, "step": 0.1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "blur_by_mask"
+    CATEGORY = "pirog/image"
+
+    def gaussian_blur_torch(self, image, sigma):
+        """
+        Fast Gaussian blur using PyTorch operations
+        """
+        if sigma <= 0:
+            return image
+            
+        # Calculate kernel size (should be odd)
+        kernel_size = int(sigma * 6 + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        # Create Gaussian kernel
+        kernel_1d = torch.exp(-0.5 * (torch.arange(kernel_size, device=image.device, dtype=image.dtype) - kernel_size // 2) ** 2 / sigma ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        
+        # Reshape for conv2d (out_channels, in_channels, height, width)
+        kernel_x = kernel_1d.view(1, 1, 1, kernel_size).expand(image.shape[-1], 1, 1, kernel_size)
+        kernel_y = kernel_1d.view(1, 1, kernel_size, 1).expand(image.shape[-1], 1, kernel_size, 1)
+        
+        # Convert image to (batch, channels, height, width) for conv2d
+        img_conv = image.permute(0, 3, 1, 2)
+        
+        # Apply separable Gaussian blur (horizontal then vertical)
+        padding = kernel_size // 2
+        blurred = torch.nn.functional.conv2d(img_conv, kernel_x, padding=(0, padding), groups=image.shape[-1])
+        blurred = torch.nn.functional.conv2d(blurred, kernel_y, padding=(padding, 0), groups=image.shape[-1])
+        
+        # Convert back to (batch, height, width, channels)
+        return blurred.permute(0, 2, 3, 1)
+
+    def blur_by_mask(self, image, mask, invert_mask, blur_amount):
+        # Ensure all inputs are on the same device
+        device = image.device
+        mask = mask.to(device)
+        
+        # Handle batch dimensions
+        batch_size = min(image.shape[0], mask.shape[0])
+        
+        # Crop to matching batch size
+        image_batch = image[:batch_size]
+        mask_batch = mask[:batch_size]
+        
+        # Resize mask to match image dimensions if needed
+        if mask_batch.shape[1:3] != image_batch.shape[1:3]:
+            mask_batch = torch.nn.functional.interpolate(
+                mask_batch.unsqueeze(1), 
+                size=(image_batch.shape[1], image_batch.shape[2]), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(1)
+        
+        # Apply blur to the image
+        if blur_amount > 0:
+            blurred_image = self.gaussian_blur_torch(image_batch, blur_amount)
+        else:
+            blurred_image = image_batch
+        
+        # Expand mask to match image channels
+        mask_expanded = mask_batch.unsqueeze(-1).expand(-1, -1, -1, image_batch.shape[-1])
+        
+        # Invert mask if requested
+        if invert_mask:
+            mask_expanded = 1.0 - mask_expanded
+        
+        # Blend: where mask is 1.0, use blurred image; where mask is 0.0, use original
+        result = image_batch * (1.0 - mask_expanded) + blurred_image * mask_expanded
+        
+        return (result,)

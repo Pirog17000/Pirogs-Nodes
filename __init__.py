@@ -1,4 +1,4 @@
-from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom
+from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask
 
 NODE_CLASS_MAPPINGS = {
     "KSamplerMultiSeed": KSamplerMultiSeed,
@@ -9,7 +9,16 @@ NODE_CLASS_MAPPINGS = {
     "PromptRandomizer": PromptRandomizer,
     "DSLRNoise": DSLRNoise,
     "TestResetButton": TestResetButton,
-    "LensSimulatedBloom": LensSimulatedBloom
+    "LensSimulatedBloom": LensSimulatedBloom,
+    "CropImage": CropImage,
+    "BatchCropFromMaskSimple": BatchCropFromMaskSimple,
+    "BatchUncropSimple": BatchUncropSimple,
+    "CropMaskByBBox": CropMaskByBBox,
+    "BlurMask": BlurMask,
+    "InvertMask": InvertMask,
+    "GradientMaskGenerator": GradientMaskGenerator,
+    "ImageBlendByMask": ImageBlendByMask,
+    "BlurByMask": BlurByMask
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -21,7 +30,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PromptRandomizer": "Prompt Randomizer",
     "DSLRNoise": "DSLR Camera Noise",
     "TestResetButton": "Test Reset Button",
-    "LensSimulatedBloom": "Lens-simulated Bloom"
+    "LensSimulatedBloom": "Lens-simulated Bloom",
+    "CropImage": "Crop Image Sides",
+    "BatchCropFromMaskSimple": "Crop From Mask",
+    "BatchUncropSimple": "Uncrop Image",
+    "CropMaskByBBox": "Crop Mask by BBox",
+    "BlurMask": "Blur Mask",
+    "InvertMask": "Invert Mask",
+    "GradientMaskGenerator": "Gradient Mask Generator",
+    "ImageBlendByMask": "Image Blend by Mask",
+    "BlurByMask": "Blur by Mask"
 }
 
 WEB_DIRECTORY = "./js"
