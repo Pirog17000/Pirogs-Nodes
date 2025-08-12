@@ -1672,6 +1672,8 @@ class BatchCropFromMaskSimple:
                 "images": ("IMAGE",),
                 "masks": ("MASK",),
                 "expansion": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+                "use_binary_mask": ("BOOLEAN", {"default": True}),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
         }
 
@@ -1680,8 +1682,15 @@ class BatchCropFromMaskSimple:
     FUNCTION = "crop"
     CATEGORY = "pirog/image"
 
-    def get_bbox_from_mask(self, mask_tensor, expansion):
-        mask = (mask_tensor > 0.5).cpu().numpy()
+    def get_bbox_from_mask(self, mask_tensor, expansion, use_binary_mask, threshold):
+        # Apply binary thresholding if requested
+        if use_binary_mask:
+            # Convert to binary: values >= threshold become 1.0, values < threshold become 0.0
+            mask = (mask_tensor >= threshold).cpu().numpy()
+        else:
+            # Use original grayscale behavior (anything > 0.5 is considered active)
+            mask = (mask_tensor > 0.5).cpu().numpy()
+        
         y_indices, x_indices = np.nonzero(mask)
         
         if len(x_indices) == 0 or len(y_indices) == 0:
@@ -1694,12 +1703,12 @@ class BatchCropFromMaskSimple:
         
         return (min_x, min_y, max_x - min_x, max_y - min_y)
 
-    def crop(self, images, masks, expansion):
+    def crop(self, images, masks, expansion, use_binary_mask, threshold):
         bboxes = []
         cropped_images = []
 
         for img, mask in zip(images, masks):
-            bbox = self.get_bbox_from_mask(mask, expansion)
+            bbox = self.get_bbox_from_mask(mask, expansion, use_binary_mask, threshold)
             if bbox is None:
                 continue
                 

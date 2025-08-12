@@ -44,7 +44,7 @@ Four interconnected nodes that streamline the crop-and-process workflow. Crop im
 
 **Crop Image Sides** - Manual cropping from any side. Sometimes you just need to trim edges or focus on a specific area.
 
-**Crop From Mask** - Automatically finds the interesting parts using masks, with optional expansion. Perfect for isolating subjects or regions that need special attention.
+**Crop From Mask** - Automatically finds the interesting parts using masks, with optional expansion and binary thresholding. Perfect for isolating subjects or regions that need special attention. Binary mode gives you precise control over which mask values count as active.
 
 **Uncrop Image** - Blends processed crops back into their original context with smart edge feathering. No harsh boundaries, just natural integration.
 
