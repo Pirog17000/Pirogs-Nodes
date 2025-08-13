@@ -86,6 +86,11 @@ Two powerful nodes that handle the most common mask-based image operations. Fina
 
 Both nodes handle dimension mismatches gracefully, work with any batch sizes, and include mask inversion options. Built for speed with memory-efficient PyTorch operations - no external dependencies, no performance bottlenecks.
 
+### 🚀 Preview Image (Queue)
+**Category:** `pirog/image`
+
+Preview node with integrated queue button. Click the button to execute just this node and its dependencies - perfect for testing parts of complex workflows without running everything.
+
 ### 🎰 Prompt Randomizer
 **Category:** `pirog/text`
 

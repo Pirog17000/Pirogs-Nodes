@@ -1,4 +1,4 @@
-from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask
+from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue
 
 NODE_CLASS_MAPPINGS = {
     "KSamplerMultiSeed": KSamplerMultiSeed,
@@ -18,7 +18,8 @@ NODE_CLASS_MAPPINGS = {
     "InvertMask": InvertMask,
     "GradientMaskGenerator": GradientMaskGenerator,
     "ImageBlendByMask": ImageBlendByMask,
-    "BlurByMask": BlurByMask
+    "BlurByMask": BlurByMask,
+    "PreviewImageQueue": PreviewImageQueue
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -39,7 +40,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "InvertMask": "Invert Mask",
     "GradientMaskGenerator": "Gradient Mask Generator",
     "ImageBlendByMask": "Image Blend by Mask",
-    "BlurByMask": "Blur by Mask"
+    "BlurByMask": "Blur by Mask",
+    "PreviewImageQueue": "Preview Image (Queue)"
 }
 
 WEB_DIRECTORY = "./js"

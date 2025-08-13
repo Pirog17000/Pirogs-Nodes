@@ -30,10 +30,10 @@ comfy_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 if comfy_dir not in sys.path:
     sys.path.insert(0, comfy_dir)
 
-# Import the common_ksampler function and MAX_RESOLUTION directly from the main nodes.py
+# Import the common_ksampler function, MAX_RESOLUTION, and SaveImage directly from the main nodes.py
 # This ensures we always use the latest version from ComfyUI
 try:
-    from nodes import common_ksampler, MAX_RESOLUTION
+    from nodes import common_ksampler, MAX_RESOLUTION, SaveImage
 except ImportError:
     # Fallback: try to import from nodes module in current directory
     spec = importlib.util.spec_from_file_location("nodes", os.path.join(comfy_dir, "nodes.py"))
@@ -41,11 +41,21 @@ except ImportError:
     spec.loader.exec_module(nodes_module)
     common_ksampler = nodes_module.common_ksampler
     MAX_RESOLUTION = nodes_module.MAX_RESOLUTION
+    SaveImage = nodes_module.SaveImage
 
 # Import required ComfyUI modules
 import comfy.samplers
 import comfy.utils
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
+try:
+    import folder_paths
+    from PIL.PngImagePlugin import PngInfo
+    from comfy.cli_args import args
+except ImportError:
+    # These will be available at runtime in ComfyUI
+    folder_paths = None
+    PngInfo = None
+    args = None
 
 
 class KSamplerMultiSeed:
@@ -2274,3 +2284,25 @@ class BlurByMask:
         result = image_batch * (1.0 - mask_expanded) + blurred_image * mask_expanded
         
         return (result,)
+
+
+class PreviewImageQueue(SaveImage):
+    """
+    PreviewImage node with a queue button
+    """
+    
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_temp_" + ''.join(random.choice("abcdefghijklmnopqrstupvxyz") for x in range(5))
+        self.compress_level = 1
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"images": ("IMAGE", ), },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
+    CATEGORY = "pirog/image"
+        
