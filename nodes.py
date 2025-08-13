@@ -15,6 +15,9 @@ import importlib.util
 import numpy as np
 from PIL import Image, ImageChops, ImageOps
 
+# Import our advanced noise generation library
+from .noise_generator import create_spectral_diverse_noise, create_hierarchical_noise
+
 # Try to import scipy for HQ blur, fallback to torch-based implementation
 try:
     from scipy.ndimage import gaussian_filter
@@ -161,6 +164,14 @@ class KSamplerMultiSeedPlus:
                                   "tooltip": "The width of the generated image in pixels (used when denoise=1.0)."}),
                 "height": ("INT", {"default": 512, "min": 16, "max": MAX_RESOLUTION, "step": 8, 
                                    "tooltip": "The height of the generated image in pixels (used when denoise=1.0)."}),
+                "noise_type": (["vanilla", "spectral-diverse", "hierarchical"], {
+                    "default": "vanilla",
+                    "tooltip": "🎲 Noise Generation Method:\n\n"
+                              "• vanilla: Standard ComfyUI noise (torch.randn) - reliable baseline\n"
+                              "• spectral-diverse: Frequency-controlled noise with pink/blue/hybrid patterns - enhanced diversity\n"
+                              "• hierarchical: Multi-scale latent-aware noise with statistical modeling - maximum quality\n\n"
+                              "Advanced methods produce more diverse and potentially higher quality results."
+                }),
             },
             "optional": {
                 "input_image": ("IMAGE", {"tooltip": "Input image for img2img (used when denoise<1.0)."}),
@@ -175,16 +186,50 @@ class KSamplerMultiSeedPlus:
     DESCRIPTION = "Integrated sampling pipeline: Creates or encodes latent → multi-seed sampling → decodes to images. For denoise=1.0 uses width/height to create empty latent. For denoise<1.0 uses input_image."
 
     def sample_integrated(self, model, vae, positive, negative, denoise, steps, cfg, seed_count, seed, 
-                         sampler_name, scheduler, width, height, input_image=None):
+                         sampler_name, scheduler, width, height, noise_type="vanilla", input_image=None):
         
         # Determine if we're doing txt2img (denoise=1.0) or img2img (denoise<1.0)
         is_txt2img = abs(denoise - 1.0) < 0.001
         
         if is_txt2img:
-            # Create empty latent image (txt2img pipeline)
+            # Create latent image (txt2img pipeline)
             if input_image is not None:
                 print("Warning: input_image provided but denoise=1.0, ignoring input_image and using width/height")
-            latent = torch.zeros([1, 4, height // 8, width // 8], device=self.device)
+            
+            # Generate initial latent - detect required channel count from model
+            try:
+                # Try to get the required latent channels from the model
+                if hasattr(model, 'model') and hasattr(model.model, 'latent_format'):
+                    latent_channels = model.model.latent_format.latent_channels
+                else:
+                    # Fallback: use 4 channels for SD/SDXL models
+                    latent_channels = 4
+                    
+                # Additional fallback based on model type detection
+                if latent_channels is None or latent_channels <= 0:
+                    # Try to detect if it's a Flux model by checking model properties
+                    try:
+                        # Check if this might be a Flux model based on common indicators
+                        model_config = getattr(model.model, 'model_config', {})
+                        if hasattr(model.model, 'diffusion_model'):
+                            # Check for Flux-specific architecture indicators
+                            diff_model = model.model.diffusion_model
+                            if (hasattr(diff_model, 'x_embedder') or 
+                                getattr(model_config, 'unet_config', {}).get('in_channels') == 16):
+                                latent_channels = 16  # Flux models use 16 channels
+                            else:
+                                latent_channels = 4   # SD/SDXL models use 4 channels
+                        else:
+                            latent_channels = 4  # Default fallback
+                    except:
+                        latent_channels = 4  # Safe fallback
+                        
+            except:
+                # Final fallback
+                latent_channels = 4
+                
+            latent_shape = [1, latent_channels, height // 8, width // 8]
+            latent = torch.zeros(latent_shape, device=self.device)
             latent_image = {"samples": latent}
         else:
             # Encode input image (img2img pipeline)
@@ -205,8 +250,35 @@ class KSamplerMultiSeedPlus:
             for i in range(seed_count):
                 current_seed = seed + i
 
-                # Reshape the single sample to a batch of 1 for the sampler
-                latent_for_sampler = {"samples": latent_sample.unsqueeze(0)}
+                # For advanced noise methods in txt2img mode, replace zeros with our noise
+                if is_txt2img and noise_type != "vanilla":
+                    # Get the shape of the current latent sample
+                    base_latent = latent_sample.unsqueeze(0)
+                    
+                    try:
+                        if noise_type == "spectral-diverse":
+                            # Generate noise directly on the target device with exact shape
+                            noise = create_spectral_diverse_noise(
+                                base_latent.shape, current_seed, device=base_latent.device, noise_type="hybrid")
+                            # Ensure exact compatibility
+                            current_latent = noise.to(device=base_latent.device, dtype=base_latent.dtype)
+                        elif noise_type == "hierarchical":
+                            # Generate noise directly on the target device with exact shape
+                            noise = create_hierarchical_noise(
+                                base_latent.shape, current_seed, device=base_latent.device, diversity_strength=1.0)
+                            # Ensure exact compatibility
+                            current_latent = noise.to(device=base_latent.device, dtype=base_latent.dtype)
+                        else:
+                            current_latent = base_latent
+                    except Exception as e:
+                        # Fallback to vanilla noise if advanced noise generation fails
+                        print(f"Warning: Advanced noise generation failed ({e}), falling back to vanilla noise")
+                        current_latent = base_latent
+                    
+                    latent_for_sampler = {"samples": current_latent}
+                else:
+                    # Use the existing latent (vanilla mode or img2img)
+                    latent_for_sampler = {"samples": latent_sample.unsqueeze(0)}
 
                 # Call the common ksampler function from the main ComfyUI nodes
                 # This ensures we always use the latest version

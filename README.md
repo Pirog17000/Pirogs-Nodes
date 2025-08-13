@@ -9,6 +9,11 @@ A collection of image processing tools that help you craft beautiful visuals. Th
 
 Generates variations by stepping through seeds automatically. Instead of manually changing seeds for each generation, this lets you explore multiple possibilities in one go. Useful when you want to see how your prompt plays out across different random states.
 
+### 🎲 KSampler (Multi-Seed+)
+**Category:** `pirog/sampling`
+
+Enhanced sampling pipeline with integrated VAE encode/decode and advanced noise generation. Features three noise methods: vanilla (standard), spectral-diverse (frequency-controlled), and hierarchical (multi-scale latent-aware). Advanced methods produce more diverse results through mathematical noise modeling rather than simple random generation.
+
 ### 🔗 Combine strings
 **Category:** `pirog/text`
 
