@@ -65,6 +65,8 @@ class KSamplerMultiSeed:
     This node is extracted from the main ComfyUI nodes.py and provides
     multi-seed sampling functionality. It automatically uses the latest
     common_ksampler function from ComfyUI, ensuring compatibility with updates.
+    
+    Features optional noise injection for generating variations.
     """
     
     @classmethod
@@ -90,6 +92,8 @@ class KSamplerMultiSeed:
                 "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"tooltip": "The algorithm used when sampling."}),
                 "scheduler": (comfy.samplers.KSampler.SCHEDULERS,
                               {"tooltip": "The scheduler controls how noise is gradually removed."}),
+                "injected_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01,
+                                             "tooltip": "Strength of noise injection for variation generation. 0.0=disabled, >0.0=blend base and variation noise."}),
             }
         }
 
@@ -100,8 +104,26 @@ class KSamplerMultiSeed:
     CATEGORY = "pirog/sampling"
     DESCRIPTION = "Generates multiple images by incrementing the seed for each generation for each latent in the input batch."
 
+    def slerp(self, val, low, high):
+        """Spherical linear interpolation for noise blending"""
+        dims = low.shape
+        low = low.reshape(dims[0], -1)
+        high = high.reshape(dims[0], -1)
+        
+        low_norm = low / torch.norm(low, dim=1, keepdim=True)
+        high_norm = high / torch.norm(high, dim=1, keepdim=True)
+        
+        low_norm[low_norm != low_norm] = 0.0
+        high_norm[high_norm != high_norm] = 0.0
+        
+        omega = torch.acos((low_norm * high_norm).sum(1))
+        so = torch.sin(omega)
+        res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+        
+        return res.reshape(dims)
+
     def sample(self, model, positive, negative, latent_image, denoise, steps, cfg, seed_count, seed, sampler_name,
-               scheduler):
+               scheduler, injected_noise=0.0):
         output_latents = []
         input_latents = latent_image["samples"]
 
@@ -113,7 +135,37 @@ class KSamplerMultiSeed:
                 current_seed = seed + i
 
                 # Reshape the single sample to a batch of 1 for the sampler
-                latent_for_sampler = {"samples": latent_sample.unsqueeze(0)}
+                work_latent = latent_sample.unsqueeze(0)
+                
+                # Apply noise injection if enabled
+                if injected_noise > 0.0:
+                    # Generate base noise from main seed
+                    generator = torch.manual_seed(seed)
+                    base_noise = torch.randn(work_latent.shape, generator=generator, device="cpu", dtype=work_latent.dtype)
+                    
+                    # Generate variation noise from current seed (naturally varies per iteration)
+                    generator = torch.manual_seed(current_seed + 12345)  # Offset to ensure different noise
+                    variation_noise = torch.randn(work_latent.shape, generator=generator, device="cpu", dtype=work_latent.dtype)
+                    
+                    # Blend noises using SLERP
+                    blended_noise = self.slerp(injected_noise, base_noise, variation_noise)
+                    
+                    # Calculate sigma scaling factor
+                    device = comfy.model_management.get_torch_device()
+                    comfy.model_management.load_model_gpu(model)
+                    sampler = comfy.samplers.KSampler(model, steps=steps, device=device, sampler=sampler_name, 
+                                                    scheduler=scheduler, denoise=1.0, model_options=model.model_options)
+                    sigmas = sampler.sigmas
+                    start_at_step = round(steps - steps * denoise)
+                    end_at_step = steps
+                    sigma = sigmas[start_at_step] - sigmas[end_at_step]
+                    sigma /= model.model.latent_format.scale_factor
+                    sigma = sigma.detach().cpu().item()
+                    
+                    # Apply scaled noise to latent
+                    work_latent = work_latent + blended_noise.to(work_latent.device) * sigma
+
+                latent_for_sampler = {"samples": work_latent}
 
                 # Call the common ksampler function from the main ComfyUI nodes
                 # This ensures we always use the latest version
@@ -182,6 +234,8 @@ class KSamplerMultiSeedPlus:
                               "• hierarchical: Multi-scale latent-aware noise with statistical modeling - maximum quality\n\n"
                               "Advanced methods produce more diverse and potentially higher quality results."
                 }),
+                "injected_noise": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "round": 0.01,
+                                             "tooltip": "Strength of noise injection for variation generation. 0.0=disabled, >0.0=blend base and variation noise."}),
             },
             "optional": {
                 "input_image": ("IMAGE", {"tooltip": "Input image for img2img (used when denoise<1.0)."}),
@@ -195,8 +249,26 @@ class KSamplerMultiSeedPlus:
     CATEGORY = "pirog/sampling"
     DESCRIPTION = "Integrated sampling pipeline: Creates or encodes latent → multi-seed sampling → decodes to images. For denoise=1.0 uses width/height to create empty latent. For denoise<1.0 uses input_image."
 
+    def slerp(self, val, low, high):
+        """Spherical linear interpolation for noise blending"""
+        dims = low.shape
+        low = low.reshape(dims[0], -1)
+        high = high.reshape(dims[0], -1)
+        
+        low_norm = low / torch.norm(low, dim=1, keepdim=True)
+        high_norm = high / torch.norm(high, dim=1, keepdim=True)
+        
+        low_norm[low_norm != low_norm] = 0.0
+        high_norm[high_norm != high_norm] = 0.0
+        
+        omega = torch.acos((low_norm * high_norm).sum(1))
+        so = torch.sin(omega)
+        res = (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+        
+        return res.reshape(dims)
+
     def sample_integrated(self, model, vae, positive, negative, denoise, steps, cfg, seed_count, seed, 
-                         sampler_name, scheduler, width, height, noise_type="vanilla", input_image=None):
+                         sampler_name, scheduler, width, height, noise_type="vanilla", injected_noise=0.0, input_image=None):
         
         # Determine if we're doing txt2img (denoise=1.0) or img2img (denoise<1.0)
         is_txt2img = abs(denoise - 1.0) < 0.001
@@ -285,10 +357,40 @@ class KSamplerMultiSeedPlus:
                         print(f"Warning: Advanced noise generation failed ({e}), falling back to vanilla noise")
                         current_latent = base_latent
                     
-                    latent_for_sampler = {"samples": current_latent}
+                    work_latent = current_latent
                 else:
                     # Use the existing latent (vanilla mode or img2img)
-                    latent_for_sampler = {"samples": latent_sample.unsqueeze(0)}
+                    work_latent = latent_sample.unsqueeze(0)
+
+                # Apply noise injection if enabled
+                if injected_noise > 0.0:
+                    # Generate base noise from main seed
+                    generator = torch.manual_seed(seed)
+                    base_noise = torch.randn(work_latent.shape, generator=generator, device="cpu", dtype=work_latent.dtype)
+                    
+                    # Generate variation noise from current seed (naturally varies per iteration)
+                    generator = torch.manual_seed(current_seed + 12345)  # Offset to ensure different noise
+                    variation_noise = torch.randn(work_latent.shape, generator=generator, device="cpu", dtype=work_latent.dtype)
+                    
+                    # Blend noises using SLERP
+                    blended_noise = self.slerp(injected_noise, base_noise, variation_noise)
+                    
+                    # Calculate sigma scaling factor
+                    device = comfy.model_management.get_torch_device()
+                    comfy.model_management.load_model_gpu(model)
+                    sampler = comfy.samplers.KSampler(model, steps=steps, device=device, sampler=sampler_name, 
+                                                    scheduler=scheduler, denoise=1.0, model_options=model.model_options)
+                    sigmas = sampler.sigmas
+                    start_at_step = round(steps - steps * denoise)
+                    end_at_step = steps
+                    sigma = sigmas[start_at_step] - sigmas[end_at_step]
+                    sigma /= model.model.latent_format.scale_factor
+                    sigma = sigma.detach().cpu().item()
+                    
+                    # Apply scaled noise to latent
+                    work_latent = work_latent + blended_noise.to(work_latent.device) * sigma
+
+                latent_for_sampler = {"samples": work_latent}
 
                 # Call the common ksampler function from the main ComfyUI nodes
                 # This ensures we always use the latest version
@@ -1848,11 +1950,43 @@ class BatchUncropSimple:
             bbox = bboxes[i % len(bboxes)]
 
             x, y, w, h = bbox
-            blend_mask = self.create_blend_mask((h, w), blend_width).to(device)
+            
+            # Ensure bbox coordinates are within original image bounds
+            orig_h, orig_w = orig_img.shape[:2]
+            x = max(0, min(x, orig_w - 1))
+            y = max(0, min(y, orig_h - 1))
+            w = min(w, orig_w - x)
+            h = min(h, orig_h - y)
+            
+            # Get actual crop dimensions
+            crop_h, crop_w = crop_img.shape[:2]
+            
+            # Always resize crop to match the actual region we're going to fill
+            # This ensures dimensional consistency
+            crop_img_resized = torch.nn.functional.interpolate(
+                crop_img.unsqueeze(0).permute(0, 3, 1, 2),  # Add batch dim and convert to BCHW
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0).permute(1, 2, 0)  # Remove batch dim and convert back to HWC
+            
+            # Create blend mask with the exact same dimensions as the target region
+            target_region_shape = orig_img[y:y+h, x:x+w].shape[:2]
+            blend_mask = self.create_blend_mask(target_region_shape, blend_width).to(device)
+            
+            # Ensure the mask dimensions match exactly
+            if blend_mask.shape != target_region_shape:
+                print(f"Warning: Adjusting blend mask from {blend_mask.shape} to {target_region_shape}")
+                blend_mask = torch.nn.functional.interpolate(
+                    blend_mask.unsqueeze(0).unsqueeze(0),
+                    size=target_region_shape,
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0).squeeze(0)
             
             for c in range(3):
                 orig_img[y:y+h, x:x+w, c] = (
-                    crop_img[:h, :w, c] * blend_mask + 
+                    crop_img_resized[:, :, c] * blend_mask + 
                     orig_img[y:y+h, x:x+w, c] * (1 - blend_mask)
                 )
             
@@ -2153,47 +2287,60 @@ class ImageBlendByMask:
         target_image = target_image.to(device)
         mask = mask.to(device)
         
-        # Handle batch dimensions - use the smallest batch size
-        batch_size = min(source_image.shape[0], target_image.shape[0], mask.shape[0])
+        # Determine output batch size - use the maximum to process all images
+        # When counts differ, we'll cycle through the smaller batch
+        batch_size = max(source_image.shape[0], target_image.shape[0], mask.shape[0])
         
-        # Crop to matching batch size
-        source_batch = source_image[:batch_size]
-        target_batch = target_image[:batch_size]
-        mask_batch = mask[:batch_size]
+        results = []
         
-        # Resize images to match if they have different dimensions
-        if source_batch.shape[1:3] != target_batch.shape[1:3]:
-            # Resize target to match source dimensions
-            target_batch = torch.nn.functional.interpolate(
-                target_batch.permute(0, 3, 1, 2), 
-                size=(source_batch.shape[1], source_batch.shape[2]), 
-                mode='bilinear', 
-                align_corners=False
-            ).permute(0, 2, 3, 1)
+        for i in range(batch_size):
+            # Cycle through batches if they have different sizes
+            source_idx = i % source_image.shape[0]
+            target_idx = i % target_image.shape[0]
+            mask_idx = i % mask.shape[0]
+            
+            source_single = source_image[source_idx:source_idx+1]
+            target_single = target_image[target_idx:target_idx+1]
+            mask_single = mask[mask_idx:mask_idx+1]
+            
+            # Resize images to match if they have different dimensions
+            if source_single.shape[1:3] != target_single.shape[1:3]:
+                # Resize target to match source dimensions
+                target_single = torch.nn.functional.interpolate(
+                    target_single.permute(0, 3, 1, 2), 
+                    size=(source_single.shape[1], source_single.shape[2]), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).permute(0, 2, 3, 1)
+            
+            # Resize mask to match image dimensions if needed
+            if mask_single.shape[1:3] != source_single.shape[1:3]:
+                mask_single = torch.nn.functional.interpolate(
+                    mask_single.unsqueeze(1), 
+                    size=(source_single.shape[1], source_single.shape[2]), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).squeeze(1)
+            
+            # Expand mask to match image channels (add channel dimension)
+            mask_expanded = mask_single.unsqueeze(-1).expand(-1, -1, -1, source_single.shape[-1])
+            
+            # Invert mask if requested
+            if invert_mask:
+                mask_expanded = 1.0 - mask_expanded
+            
+            # Apply blend amount to mask
+            blend_mask = mask_expanded * blend_amount
+            
+            # Perform the blend: result = source * (1 - blend_mask) + target * blend_mask
+            result_single = source_single * (1.0 - blend_mask) + target_single * blend_mask
+            
+            results.append(result_single)
         
-        # Resize mask to match image dimensions if needed
-        if mask_batch.shape[1:3] != source_batch.shape[1:3]:
-            mask_batch = torch.nn.functional.interpolate(
-                mask_batch.unsqueeze(1), 
-                size=(source_batch.shape[1], source_batch.shape[2]), 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(1)
+        # Stack all results
+        final_result = torch.cat(results, dim=0)
         
-        # Expand mask to match image channels (add channel dimension)
-        mask_expanded = mask_batch.unsqueeze(-1).expand(-1, -1, -1, source_batch.shape[-1])
-        
-        # Invert mask if requested
-        if invert_mask:
-            mask_expanded = 1.0 - mask_expanded
-        
-        # Apply blend amount to mask
-        blend_mask = mask_expanded * blend_amount
-        
-        # Perform the blend: result = source * (1 - blend_mask) + target * blend_mask
-        result = source_batch * (1.0 - blend_mask) + target_batch * blend_mask
-        
-        return (result,)
+        return (final_result,)
 
 
 class BlurByMask:
