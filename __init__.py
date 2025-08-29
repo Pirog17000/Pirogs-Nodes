@@ -1,4 +1,8 @@
-from .nodes import KSamplerMultiSeed, KSamplerMultiSeedPlus, StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue
+# Import enhanced KSampler classes from the node_modules package
+from .node_modules.samplermultiseed import KSamplerMultiSeed, KSamplerMultiSeedPlus
+
+# Import other classes from the main nodes.py file
+from .nodes import StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue
 
 NODE_CLASS_MAPPINGS = {
     "KSamplerMultiSeed": KSamplerMultiSeed,

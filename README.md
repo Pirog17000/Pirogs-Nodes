@@ -12,7 +12,16 @@ Generates variations by stepping through seeds automatically. Instead of manuall
 ### 🎲 KSampler (Multi-Seed+)
 **Category:** `pirog/sampling`
 
-Enhanced sampling pipeline with integrated VAE encode/decode and advanced noise generation. Features three noise methods: vanilla (standard), spectral-diverse (frequency-controlled), and hierarchical (multi-scale latent-aware). Advanced methods produce more diverse results through mathematical noise modeling rather than simple random generation.
+An all-in-one advanced sampler that combines multi-seed and batch processing with a powerful tiling system for working on large images. It seamlessly splits an image into tiles, processes each one as a separate inpainting task, and then blends them back together with gradient masks to create a flawless final image.
+
+**Key Features:**
+- **Seamless Tiling:** Overcomes VRAM limitations by splitting large images into smaller tiles.
+- **Gradient Blending:** Uses percentage-based overlap with smooth gradient masks to eliminate visible seams between tiles.
+- **Inpainting-Aware:** Each tile is treated as an inpainting task, ensuring that the content generated in the overlapping areas is contextually aware and blends perfectly.
+- **Batch Processing:** Correctly handles batches of images, making it perfect for chaining multiple KSamplers.
+- **Advanced Noise:** Includes vanilla, spectral-diverse, and hierarchical noise generation for more creative control.
+
+This node is ideal for upscaling, outpainting, or high-resolution rendering where you need to process an image in sections without artifacts.
 
 ### 🔗 Combine strings
 **Category:** `pirog/text`
@@ -116,9 +125,11 @@ Built with clean architecture and proper error handling. Each node does one thin
 ```
 Pirogs-Nodes/
 ├── __init__.py              # Node mappings
-├── nodes.py                 # All implementations
+├── nodes.py                 # Core node implementations
+├── node_modules/            # Modularized nodes (e.g., KSamplers)
+├── js/                      # Custom UI javascript (e.g., reset buttons)
 ├── README.md                # This file
-├── prompt_dictionary.json   # For randomizer
+├── random_dictionary.json   # For randomizer
 └── pyproject.toml           # Package config
 ```
 
