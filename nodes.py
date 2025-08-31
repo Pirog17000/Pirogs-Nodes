@@ -14,16 +14,10 @@ import logging
 import importlib.util
 import numpy as np
 from PIL import Image, ImageChops, ImageOps
+from scipy.ndimage import gaussian_filter
 
 # Import our advanced noise generation library
-from .noise_generator import create_spectral_diverse_noise, create_hierarchical_noise
-
-# Try to import scipy for HQ blur, fallback to torch-based implementation
-try:
-    from scipy.ndimage import gaussian_filter
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+# from .noise_generator import create_spectral_diverse_noise, create_hierarchical_noise
 
 # Add the ComfyUI root directory to Python path to access the main nodes
 comfy_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,9 +38,8 @@ except ImportError:
     SaveImage = nodes_module.SaveImage
 
 # Import required ComfyUI modules
-import comfy.samplers
-import comfy.utils
-from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
+# import comfy.samplers
+from comfy.comfy_types import IO, ComfyNodeABC #, InputTypeDict
 try:
     import folder_paths
     from PIL.PngImagePlugin import PngInfo
@@ -593,15 +586,15 @@ class PromptRandomizer:
             try:
                 with open(dictionary_path, 'w', encoding='utf-8') as dict_file:
                     json.dump(default_dict, dict_file, indent=2, ensure_ascii=False)
-                print(f"Created default dictionary at: {dictionary_path}")
+                logging.info(f"Created default dictionary at: {dictionary_path}")
             except Exception as e:
-                print(f"Could not create dictionary file: {e}")
+                logging.warning(f"Could not create dictionary file: {e}")
             return default_dict
         except json.JSONDecodeError as e:
-            print(f"Invalid JSON in dictionary file: {dictionary_path}. Using default dictionary. Error: {e}")
+            logging.warning(f"Invalid JSON in dictionary file: {dictionary_path}. Using default dictionary. Error: {e}")
             return self.create_default_dictionary()
         except Exception as e:
-            print(f"Error reading dictionary file: {dictionary_path}. Using default dictionary. Error: {e}")
+            logging.error(f"Error reading dictionary file: {dictionary_path}. Using default dictionary. Error: {e}")
             return self.create_default_dictionary()
 
     def create_default_dictionary(self):
@@ -666,6 +659,72 @@ class PromptRandomizer:
         return text.strip()
 
 
+# --- Camera Sensor Profiles ---
+# Based on research into camera sensor performance. These profiles dictate the
+# physical characteristics of the simulated sensor.
+CAMERA_PROFILES = {
+    "Pro Full-Frame": {
+        "read_noise_base_e": 1.5,      # Electrons of read noise at base ISO (e.g., ISO 100)
+        "read_noise_iso_scaling": 0.15,# How much read noise increases with analog gain
+        "dark_current_base": 0.1,     # Electrons/sec at 20°C - a measure of thermal noise
+        "prnu_factor": 0.004,          # Photo Response Non-Uniformity (multiplicative noise)
+        "dsnu_factor": 0.002,          # Dark Signal Non-Uniformity (additive fixed pattern noise)
+        "quantization_levels": 16384,  # 14-bit ADC (Analog-to-Digital Converter)
+        "full_well_capacity": 90000,   # Maximum electrons a pixel can hold
+        "chroma_noise_factor": 0.4,    # Balance between luminance and chrominance noise
+    },
+    "APS-C Enthusiast": {
+        "read_noise_base_e": 2.5,
+        "read_noise_iso_scaling": 0.25,
+        "dark_current_base": 1.5,
+        "prnu_factor": 0.007,
+        "dsnu_factor": 0.005,
+        "quantization_levels": 4096,   # 12-bit ADC
+        "full_well_capacity": 60000,
+        "chroma_noise_factor": 0.5,
+    },
+    "Smartphone": {
+        "read_noise_base_e": 4.0,
+        "read_noise_iso_scaling": 0.35,
+        "dark_current_base": 1.2,
+        "prnu_factor": 0.01,
+        "dsnu_factor": 0.008,
+        "quantization_levels": 1024,   # 10-bit ADC
+        "full_well_capacity": 15000,
+        "chroma_noise_factor": 0.6,
+    },
+    "Vintage DSLR": {
+        "read_noise_base_e": 5.5,
+        "read_noise_iso_scaling": 0.4,
+        "dark_current_base": 4.5,
+        "prnu_factor": 0.012,
+        "dsnu_factor": 0.01,
+        "quantization_levels": 4096,   # 12-bit ADC
+        "full_well_capacity": 45000,
+        "chroma_noise_factor": 0.7,
+    }
+}
+
+
+def srgb_to_linear(img):
+    """Converts sRGB image data to linear RGB."""
+    mask = img <= 0.04045
+    return np.where(mask, img / 12.92, ((img + 0.055) / 1.055) ** 2.4)
+
+def linear_to_srgb(img):
+    """Converts linear RGB image data to sRGB."""
+    mask = img <= 0.0031308
+    srgb = np.where(mask, img * 12.92, 1.055 * (img ** (1.0 / 2.4)) - 0.055)
+    return np.clip(srgb, 0.0, 1.0)
+
+def apply_noise_blur(noise, blur_sigma):
+    """Applies a Gaussian blur to the generated noise field."""
+    if blur_sigma > 0:
+        for c in range(noise.shape[2]):
+            noise[:, :, c] = gaussian_filter(noise[:, :, c], sigma=blur_sigma)
+    return noise
+
+
 class DSLRNoise(ComfyNodeABC):
     """
     DSLR Camera Noise Simulation Node
@@ -681,413 +740,139 @@ class DSLRNoise(ComfyNodeABC):
     """
     
     @classmethod
-    def INPUT_TYPES(s) -> InputTypeDict:
+    def INPUT_TYPES(s):
         return {
             "required": {
-                "image": (IO.IMAGE, {
-                    "tooltip": "📸 Input image to apply DSLR camera noise simulation. Works with any resolution and batch size."
+                "image": ("IMAGE", {
+                    "tooltip": "The input image to apply noise to."
                 }),
-                
-                "iso": (IO.INT, {
-                    "default": 800, "min": 100, "max": 25600, "step": 100,
-                    "tooltip": "📊 ISO Sensitivity (100-25600): Camera's light sensitivity setting.\n\n"
-                              "• 100-400: Clean, minimal noise (bright daylight)\n"
-                              "• 800-1600: Moderate noise (indoor/evening)\n"
-                              "• 3200-6400: High noise (low light conditions)\n"
-                              "• 12800+: Very noisy (extreme low light)\n\n"
-                              "📋 Default: 800 (realistic indoor photography)"
+                "iso": ("INT", {
+                    "default": 800, "min": 50, "max": 12800, "step": 50,
+                    "tooltip": "Higher ISO increases noise, simulating higher light sensitivity."
                 }),
-                
-                "camera_model": (["modern_fullframe", "modern_apsc", "older_sensor", "high_end"], {
-                    "default": "modern_fullframe",
-                    "tooltip": "📷 Camera Sensor Type: Different sensor technologies have unique noise characteristics.\n\n"
-                              "• Modern Full-Frame: Clean, low noise (e.g., Canon R5, Sony A7R)\n"
-                              "• Modern APS-C: Slightly more noise, good performance (e.g., Fuji X-T5)\n"
-                              "• Older Sensor: Higher noise, pattern issues (e.g., Canon 20D era)\n"
-                              "• High-End: Extremely clean, professional (e.g., Phase One, Canon R3)\n\n"
-                              "📋 Default: modern_fullframe"
+                "profile": (list(CAMERA_PROFILES.keys()), {
+                    "tooltip": "Select a camera sensor profile. Each profile has distinct noise characteristics."
                 }),
-                
-                "temperature": (IO.FLOAT, {
-                    "default": 20.0, "min": -10.0, "max": 60.0, "step": 1.0,
-                    "tooltip": "🌡️ Sensor Temperature (°C): Heat significantly affects digital noise.\n\n"
-                              "• -10°C to 10°C: Minimal thermal noise (cold weather)\n"
-                              "• 20°C: Room temperature baseline\n"
-                              "• 30°C+: Increased thermal noise (hot environments)\n"
-                              "• 50°C+: Significant noise increase (overheated sensor)\n\n"
-                              "📋 Default: 20°C (room temperature)"
+                "temperature": ("FLOAT", {
+                    "default": 25.0, "min": -20.0, "max": 60.0, "step": 1.0,
+                    "tooltip": "Sensor temperature (Celsius). Higher temperatures increase thermal noise."
                 }),
-                
-                "exposure_time": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.001, "max": 30.0, "step": 0.1,
-                    "tooltip": "⏱️ Exposure Time (seconds): Longer exposures accumulate more thermal noise.\n\n"
-                              "• 0.001-0.1s: Fast shutter, minimal thermal impact\n"
-                              "• 1-5s: Moderate exposure, some thermal buildup\n"
-                              "• 10-30s: Long exposure, significant thermal noise\n\n"
-                              "📋 Default: 1.0s (standard exposure)"
+                "exposure_time": ("FLOAT", {
+                    "default": 1/125.0, "min": 0.0, "max": 30.0, "step": 0.001,
+                    "tooltip": "Shutter speed (seconds). Longer exposures increase thermal noise and affect shot noise."
                 }),
-                
-                "strength": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1,
-                    "tooltip": "💪 Overall Noise Strength: Master intensity control for all noise types.\n\n"
-                              "• 0.0: No noise applied\n"
-                              "• 0.5: Subtle, realistic noise\n"
-                              "• 1.0: Standard DSLR noise levels\n"
-                              "• 1.5-2.0: Enhanced noise for artistic effect\n"
-                              "• 2.5-3.0: Heavy noise for dramatic/vintage looks\n\n"
-                              "📋 Default: 1.0 (realistic levels)"
+                "overall_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05,
+                    "tooltip": "Artistic multiplier for the final calculated noise. 1.0 is physically accurate."
                 }),
-                
-                "seed": (IO.INT, {
-                    "default": 0, "min": 0, "max": 0xffffffffffffffff, 
-                    "control_after_generate": True,
-                    "tooltip": "🎲 Random Seed: Controls noise pattern reproducibility.\n\n"
-                              "• Same seed = identical noise pattern\n"
-                              "• Different seed = different noise distribution\n"
-                              "• Auto-increment after generation for variation\n\n"
-                              "📋 Default: 0 (click 🎲 to randomize)"
+                "noise_blur": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.5, "step": 0.01,
+                    "tooltip": "Applies a Gaussian blur to the final noise pattern to simulate softness."
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "The random seed for the noise generation, allowing for reproducible patterns."
                 }),
             },
-            
-            "optional": {
-                "shot_noise_strength": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1,
-                    "tooltip": "📸 Shot Noise Strength: Photon noise from light quantization (main noise source).\n\n"
-                              "• 0.0: Disable shot noise (unrealistic)\n"
-                              "• 0.5: Reduced shot noise\n"
-                              "• 1.0: Accurate shot noise levels\n"
-                              "• 1.5-2.0: Enhanced for artistic effect\n\n"
-                              "This is the primary noise in well-lit areas. Follows Poisson statistics.\n"
-                              "📋 Default: 1.0 (scientifically accurate)"
-                }),
-                
-                "read_noise_strength": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1,
-                    "tooltip": "🔌 Read Noise Strength: Electronic noise from sensor readout circuitry.\n\n"
-                              "• 0.0: Perfect sensor (unrealistic)\n"
-                              "• 0.5: High-end sensor performance\n"
-                              "• 1.0: Typical DSLR read noise\n"
-                              "• 1.5-2.0: Older/budget sensor simulation\n\n"
-                              "Most visible in shadows and dark areas. Constant regardless of signal.\n"
-                              "📋 Default: 1.0 (typical DSLR)"
-                }),
-                
-                "thermal_noise_strength": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1,
-                    "tooltip": "🔥 Thermal Noise Strength: Heat-generated electron noise.\n\n"
-                              "• 0.0: No thermal effects\n"
-                              "• 0.5: Well-cooled sensor\n"
-                              "• 1.0: Normal thermal noise\n"
-                              "• 1.5-2.0: Hot sensor conditions\n\n"
-                              "Increases exponentially with temperature and exposure time.\n"
-                              "📋 Default: 1.0 (normal conditions)"
-                }),
-                
-                "pattern_noise_strength": (IO.FLOAT, {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1,
-                    "tooltip": "📊 Pattern Noise Strength: Fixed pattern and banding noise.\n\n"
-                              "• 0.0: Modern sensor (no visible patterns)\n"
-                              "• 0.3: Slight banding (some older sensors)\n"
-                              "• 0.5-0.7: Noticeable patterns (older DSLRs)\n"
-                              "• 1.0: Strong patterns (vintage/damaged sensors)\n\n"
-                              "Creates horizontal/vertical banding. Mostly historical interest.\n"
-                              "📋 Default: 0.0 (modern sensors are clean)"
-                }),
-                
-                "prnu_strength": (IO.FLOAT, {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1,
-                    "tooltip": "🎯 PRNU Strength: Pixel Response Non-Uniformity.\n\n"
-                              "• 0.0: Perfect pixel uniformity (unrealistic)\n"
-                              "• 0.5: High-end sensor quality\n"
-                              "• 1.0: Typical DSLR variation (~0.5-1%)\n"
-                              "• 1.5-2.0: Enhanced variation for effect\n\n"
-                              "Each pixel responds slightly differently. Most visible in bright areas.\n"
-                              "📋 Default: 1.0 (realistic variation)"
-                }),
-                
-                "color_noise_ratio": (IO.FLOAT, {
-                    "default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "🌈 Color vs Luminance Noise: Controls noise correlation between RGB channels.\n\n"
-                              "• 0.0: Pure luminance noise (correlated, grayscale-like)\n"
-                              "• 0.25: Realistic DSLR balance (mostly correlated)\n"
-                              "• 0.5: Balanced color/luminance noise\n"
-                              "• 1.0: Full color noise (independent RGB channels)\n\n"
-                              "Lower values = more film-like, Higher values = more digital artifacts.\n"
-                              "📋 Default: 0.25 (realistic DSLR behavior)"
-                }),
-                
-                "noise_blur": (IO.FLOAT, {
-                    "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.1,
-                    "tooltip": "🌫️ Noise Blur (HQ): Applies high-quality Gaussian blur to NOISE PATTERNS before adding to image.\n\n"
-                              "• 0.0: Sharp, crisp noise (unrealistic for high ISO)\n"
-                              "• 0.2-0.5: Subtle noise softening (realistic high ISO)\n"
-                              "• 0.6-1.0: Moderate noise blur (very high ISO, low light)\n"
-                              "• 1.2-2.0: Strong noise blur (extreme conditions)\n\n"
-                              "Real DSLR noise has natural softness due to:\n"
-                              "• Sensor physical limitations at pixel level\n"
-                              "• Anti-aliasing and optical effects\n"
-                              "• Thermal electron diffusion\n\n"
-                              "⚠️ IMPORTANT: Blurs NOISE ONLY, not the final image!\n"
-                              "📋 Default: 0.0 (sharp noise, set 0.3+ for realism)"
-                }),
-            }
         }
 
     RETURN_TYPES = (IO.IMAGE,)
     OUTPUT_TOOLTIPS = ("📸 Image with scientifically accurate DSLR camera noise applied using real sensor physics.",)
-    FUNCTION = "add_dslr_noise"
+    FUNCTION = "add_camera_noise"
     CATEGORY = "pirog/image"
     DESCRIPTION = "🔬 Adds scientifically accurate DSLR camera sensor noise based on real sensor physics and measurements. Includes shot noise (Poisson), read noise (electronic), thermal noise (heat), PRNU (pixel variation), and pattern noise (banding). Each component can be controlled independently for realistic or artistic effects."
 
-    def add_dslr_noise(self, image, iso, camera_model, temperature, exposure_time, strength, seed,
-                       shot_noise_strength=1.0, read_noise_strength=1.0, thermal_noise_strength=1.0,
-                       pattern_noise_strength=0.0, prnu_strength=1.0, color_noise_ratio=0.25, noise_blur=0.0):
+    def add_camera_noise(self, image, iso, profile, temperature, exposure_time, overall_strength, noise_blur, seed):
         
-        # Handle potential string values from ComfyUI's control_after_generate feature
-        def safe_float(value, default):
-            """Safely convert value to float, using default if conversion fails"""
-            if isinstance(value, str):
-                try:
-                    return float(value)
-                except (ValueError, TypeError):
-                    return default
-            elif isinstance(value, (int, float)):
-                return float(value)
-            else:
-                return default
-        
-        # Sanitize all float parameters
-        shot_noise_strength = safe_float(shot_noise_strength, 1.0)
-        read_noise_strength = safe_float(read_noise_strength, 1.0)
-        thermal_noise_strength = safe_float(thermal_noise_strength, 1.0)
-        pattern_noise_strength = safe_float(pattern_noise_strength, 0.0)
-        prnu_strength = safe_float(prnu_strength, 1.0)
-        color_noise_ratio = safe_float(color_noise_ratio, 0.25)
-        noise_blur = safe_float(noise_blur, 0.0)
-        
-        # Set random seeds for reproducibility
-        # Ensure NumPy seed is within valid range (0 to 2^32 - 1)
         np_seed = seed % (2**32)
         torch.manual_seed(seed)
         np.random.seed(np_seed)
         
-        # Convert to numpy for processing
+        params = CAMERA_PROFILES[profile]
+        
         img_np = image.cpu().numpy()
         batch_size, height, width, channels = img_np.shape
         
-        # Camera sensor parameters based on research data
-        camera_params = {
-            "modern_fullframe": {"read_noise_e": 2.5, "full_well": 90000, "gain_factor": 1.0, "prnu_factor": 0.006},
-            "modern_apsc": {"read_noise_e": 3.2, "full_well": 60000, "gain_factor": 1.1, "prnu_factor": 0.008},
-            "older_sensor": {"read_noise_e": 5.5, "full_well": 45000, "gain_factor": 1.3, "prnu_factor": 0.012},
-            "high_end": {"read_noise_e": 1.8, "full_well": 120000, "gain_factor": 0.9, "prnu_factor": 0.004}
-        }
-        
-        params = camera_params[camera_model]
-        
-        # ISO-dependent parameters (based on camera research)
-        # Read noise increases with ISO due to amplification
-        iso_factor = iso / 100.0
-        read_noise_adu = params["read_noise_e"] * np.sqrt(iso_factor) * params["gain_factor"]
-        
-        # Thermal noise (doubles every ~6-8°C above 20°C)
-        temp_factor = 2.0 ** ((temperature - 20.0) / 7.0) if temperature > 20 else 1.0
-        thermal_noise_rate = 0.1 * temp_factor * exposure_time  # electrons per second per pixel
-        
-        # Convert images to linear sensor space (critical for accurate noise modeling)
-        # Most images are in sRGB, convert to linear
-        linear_images = self.srgb_to_linear(img_np)
-        
-        # Scale to ADU space (typical DSLR: 0-4095 or 0-16383)
-        max_adu = 4095.0  # 12-bit sensor
-        linear_adu = linear_images * max_adu
+        linear_images = srgb_to_linear(img_np)
+        signal_e = linear_images * params["full_well_capacity"]
         
         output_images = []
         
         for b in range(batch_size):
-            img_adu = linear_adu[b].copy()
+            current_signal_e = signal_e[b].copy()
+
+            # 1. PRNU (Photo Response Non-Uniformity) - Multiplicative signal noise
+            prnu_noise = np.random.normal(1.0, params["prnu_factor"], current_signal_e.shape)
+            current_signal_e *= prnu_noise
+
+            ### MODIFIED ###
+            # To make exposure_time meaningful, we simulate the lighting conditions. A long exposure
+            # implies a dark scene (fewer photons per second). We scale the signal down for the
+            # purpose of noise calculation to reflect this, which correctly reduces shot noise
+            # and makes read noise more prominent, as it would be in a real long exposure.
+            reference_exposure = 1.0 / 125.0  # A typical baseline shutter speed
+            safe_exposure_time = max(exposure_time, 1e-6) # Avoid division by zero
+            signal_scaler = reference_exposure / safe_exposure_time
+            scaled_signal_for_noise_calc = current_signal_e * signal_scaler
+
+            # 2. Shot Noise (Pre-gain)
+            # We now use the scaled signal to calculate shot noise. The original signal is used
+            # later to preserve the image's actual brightness.
+            shot_noise_e = np.random.poisson(np.maximum(scaled_signal_for_noise_calc, 0)) - scaled_signal_for_noise_calc
+
+            # 3. Thermal Noise (Dark Current & DSNU) (Pre-gain)
+            # This part correctly uses exposure_time already, so no changes are needed.
+            temp_factor = 2.0 ** ((temperature - 20.0) / 7.0)
+            dark_current_e = params["dark_current_base"] * temp_factor * exposure_time
+            dsnu_pattern = np.random.normal(1.0, params["dsnu_factor"], current_signal_e.shape)
+            dark_current_with_dsnu = dark_current_e * dsnu_pattern
+            thermal_noise_e = np.random.poisson(np.maximum(dark_current_with_dsnu, 0)) - dark_current_with_dsnu
+
+            # 4. ISO Gain and Read Noise (Post-gain)
+            gain = max(iso / 100.0, 1.0)
+            read_noise_std = params["read_noise_base_e"] + (gain - 1.0) * params["read_noise_iso_scaling"]
+
+            base_luma_noise = np.random.normal(0, read_noise_std, (height, width, 1))
+
+            chroma_h, chroma_w = height // 2, width // 2
+            lowres_chroma_noise = np.random.normal(0, read_noise_std, (chroma_h, chroma_w, channels))
+            chroma_noise = np.repeat(np.repeat(lowres_chroma_noise, 2, axis=0), 2, axis=1)
+            chroma_noise = chroma_noise[:height, :width, :]
+
+            chroma_factor = params["chroma_noise_factor"]
+            read_noise = base_luma_noise * (1.0 - chroma_factor) + chroma_noise * chroma_factor
             
-            # 1. SHOT NOISE (Poisson distributed, variance = signal)
-            # Research: shot noise variance is EQUAL to the signal level
-            if shot_noise_strength > 0:
-                # Ensure positive values for Poisson statistics
-                signal = np.maximum(img_adu, 0.1)
-                
-                # Shot noise standard deviation = sqrt(signal)
-                shot_std = np.sqrt(signal)
-                shot_noise = np.random.normal(0, shot_std, img_adu.shape)
-                
-                # Apply blur to shot noise if requested
-                if noise_blur > 0.0:
-                    shot_noise = self.apply_noise_blur(shot_noise, noise_blur)
-                
-                img_adu += shot_noise * shot_noise_strength * strength
-            
-            # 2. READ NOISE (Gaussian, constant standard deviation)
-            # Research: independent of signal level, increases with ISO
-            if read_noise_strength > 0:
-                read_std = read_noise_adu
-                if color_noise_ratio < 1.0 and channels >= 3:
-                    # Generate correlated read noise (more luminance-like)
-                    base_noise = np.random.normal(0, read_std, img_adu.shape[:2])
-                    luma_noise = np.stack([base_noise] * channels, axis=2)
-                    color_noise = np.random.normal(0, read_std, img_adu.shape)
-                    
-                    # Apply blur to noise components if requested
-                    if noise_blur > 0.0:
-                        luma_noise = self.apply_noise_blur(luma_noise, noise_blur)
-                        color_noise = self.apply_noise_blur(color_noise, noise_blur)
-                    
-                    read_noise = (luma_noise * (1.0 - color_noise_ratio) + 
-                                 color_noise * color_noise_ratio)
-                else:
-                    # Full color noise (independent per channel)
-                    read_noise = np.random.normal(0, read_std, img_adu.shape)
-                    
-                    # Apply blur to read noise if requested
-                    if noise_blur > 0.0:
-                        read_noise = self.apply_noise_blur(read_noise, noise_blur)
-                
-                img_adu += read_noise * read_noise_strength * strength
-            
-            # 3. THERMAL NOISE (Gaussian, depends on temperature and time)
-            # Research: increases exponentially with temperature
-            if thermal_noise_strength > 0:
-                thermal_std = np.sqrt(thermal_noise_rate * iso_factor)
-                if color_noise_ratio < 1.0 and channels >= 3:
-                    # Generate correlated thermal noise (more luminance-like)
-                    base_noise = np.random.normal(0, thermal_std, img_adu.shape[:2])
-                    luma_noise = np.stack([base_noise] * channels, axis=2)
-                    color_noise = np.random.normal(0, thermal_std, img_adu.shape)
-                    
-                    # Apply blur to thermal noise components if requested
-                    if noise_blur > 0.0:
-                        luma_noise = self.apply_noise_blur(luma_noise, noise_blur)
-                        color_noise = self.apply_noise_blur(color_noise, noise_blur)
-                    
-                    thermal_noise = (luma_noise * (1.0 - color_noise_ratio) + 
-                                   color_noise * color_noise_ratio)
-                else:
-                    # Full color noise (independent per channel)
-                    thermal_noise = np.random.normal(0, thermal_std, img_adu.shape)
-                    
-                    # Apply blur to thermal noise if requested
-                    if noise_blur > 0.0:
-                        thermal_noise = self.apply_noise_blur(thermal_noise, noise_blur)
-                
-                img_adu += thermal_noise * thermal_noise_strength * strength
-            
-            # 4. PRNU (Pixel Response Non-Uniformity)
-            # Research: noise proportional to signal, ~0.5-1% variation
-            if prnu_strength > 0:
-                prnu_factor = params["prnu_factor"]
-                prnu_variation = 1.0 + np.random.normal(0, prnu_factor, img_adu.shape)
-                img_adu = img_adu * prnu_variation * prnu_strength
-            
-            # 5. PATTERN NOISE (Fixed pattern + variable banding)
-            # Research: visible in older sensors, row/column correlated
-            if pattern_noise_strength > 0:
-                # Fixed row pattern
-                row_pattern = np.random.normal(0, read_noise_adu * 0.3, (height, 1, channels))
-                row_pattern = np.tile(row_pattern, (1, width, 1))
-                
-                # Fixed column pattern  
-                col_pattern = np.random.normal(0, read_noise_adu * 0.2, (1, width, channels))
-                col_pattern = np.tile(col_pattern, (height, 1, 1))
-                
-                # Apply blur to pattern noise if requested
-                pattern_noise = row_pattern + col_pattern
-                if noise_blur > 0.0:
-                    pattern_noise = self.apply_noise_blur(pattern_noise, noise_blur)
-                
-                img_adu += pattern_noise * pattern_noise_strength * strength
-            
-            # Color noise handling is now done during noise generation above
-            # (read noise and thermal noise sections) to preserve image colors
-            
-            # Convert back to 0-1 range
-            img_linear = np.clip(img_adu / max_adu, 0.0, 1.0)
-            
-            # Convert back to sRGB space
-            img_final = self.linear_to_srgb(img_linear)
+            # Note: The blur application was removed from here.
+
+            # 5. Combine All Noise Components
+            # The original signal is NOT amplified. Pre-gain noise is amplified. Post-gain noise is not.
+            total_noise = (shot_noise_e + thermal_noise_e) * gain + read_noise
+
+            ### MODIFIED ###
+            # The blur is now applied to the FINAL combined noise map. This is more efficient
+            # and better simulates how the entire camera pipeline (demosaicing, etc.) can
+            # soften the appearance of noise.
+            if noise_blur > 0.0:
+                # Assuming apply_noise_blur takes the noise map and a sigma value for the blur.
+                # A direct mapping is used here, but you could scale it, e.g., blur_sigma = noise_blur * 0.8
+                blur_sigma = noise_blur
+                total_noise = apply_noise_blur(total_noise, blur_sigma)
+
+            # 6. Add Noise to Signal and Apply Overall Strength
+            # The base signal is the original `current_signal_e` to preserve brightness.
+            signal_with_all_noise = current_signal_e + (total_noise * overall_strength)
+
+            # 7. Quantize and Convert Back
+            conversion_gain = params["full_well_capacity"] / params["quantization_levels"]
+            final_adu = signal_with_all_noise / conversion_gain
+            clipped_adu = np.clip(final_adu, 0, params["quantization_levels"])
+            img_linear = clipped_adu / params["quantization_levels"]
+            img_final = linear_to_srgb(img_linear)
             
             output_images.append(img_final)
-        
+            
         result = np.stack(output_images, axis=0)
-        
         return (torch.from_numpy(result).float(),)
-    
-    def srgb_to_linear(self, srgb):
-        """Convert sRGB to linear RGB space"""
-        # sRGB to linear conversion (proper, not gamma 2.2)
-        linear = np.where(srgb <= 0.04045,
-                         srgb / 12.92,
-                         np.power((srgb + 0.055) / 1.055, 2.4))
-        return linear
-    
-    def linear_to_srgb(self, linear):
-        """Convert linear RGB to sRGB space"""
-        # Linear to sRGB conversion
-        srgb = np.where(linear <= 0.0031308,
-                       linear * 12.92,
-                       1.055 * np.power(linear, 1.0/2.4) - 0.055)
-        return np.clip(srgb, 0.0, 1.0)
-    
-    def apply_noise_blur(self, noise, blur_strength):
-        """Apply blur specifically to noise patterns before adding to image"""
-        if blur_strength <= 0.0:
-            return noise
-        
-        # Convert blur strength to sigma (reasonable range: 0.1 to 2.0)
-        sigma = np.clip(blur_strength, 0.1, 2.0)
-        
-        # Apply blur to noise using existing blur implementation
-        return self.apply_gaussian_blur(noise, sigma)
-    
-    def apply_gaussian_blur(self, image, sigma):
-        """Apply high-quality Gaussian blur using scipy if available, otherwise torch fallback"""
-        if SCIPY_AVAILABLE:
-            # Use scipy for highest quality blur
-            blurred = image.copy()
-            height, width, channels = image.shape
-            for c in range(channels):
-                blurred[:,:,c] = gaussian_filter(image[:,:,c], sigma=sigma, mode='reflect')
-            return np.clip(blurred, 0.0, 1.0)
-        else:
-            # Fallback to torch-based blur implementation
-            return self.torch_gaussian_blur(image, sigma)
-    
-    def torch_gaussian_blur(self, image, sigma):
-        """Torch-based Gaussian blur implementation as fallback"""
-        # Convert numpy to torch
-        img_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()  # BHWC -> BCHW
-        
-        # Create Gaussian kernel
-        kernel_size = int(6 * sigma + 1)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        
-        # Generate 1D Gaussian kernel
-        x = torch.arange(kernel_size).float() - kernel_size // 2
-        kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        
-        # Create 2D kernel
-        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
-        kernel_2d = kernel_2d.expand(img_tensor.size(1), 1, kernel_size, kernel_size)
-        
-        # Apply blur with padding
-        padding = kernel_size // 2
-        blurred = torch.nn.functional.conv2d(
-            img_tensor, 
-            kernel_2d, 
-            padding=padding, 
-            groups=img_tensor.size(1)
-        )
-        
-        # Convert back to numpy
-        blurred = blurred.squeeze(0).permute(1, 2, 0).cpu().numpy()  # BCHW -> HWC
-        return np.clip(blurred, 0.0, 1.0)
 
 
 class TestResetButton:
@@ -1625,7 +1410,7 @@ class BatchUncropSimple:
             
             # Ensure the mask dimensions match exactly
             if blend_mask.shape != target_region_shape:
-                print(f"Warning: Adjusting blend mask from {blend_mask.shape} to {target_region_shape}")
+                logging.warning(f"Warning: Adjusting blend mask from {blend_mask.shape} to {target_region_shape}")
                 blend_mask = torch.nn.functional.interpolate(
                     blend_mask.unsqueeze(0).unsqueeze(0),
                     size=target_region_shape,
@@ -1851,12 +1636,9 @@ class GradientMaskGenerator:
             
             # Determine which side of midpoint each pixel is on
             above_mid = mask >= 0.5
-            below_mid = mask < 0.5
-            
             # Apply contrast expansion
             # contrast=0: no change, contrast=1: maximum separation
             expanded_distance = distance_from_mid + contrast * (0.5 - distance_from_mid)
-            
             # Reconstruct values on correct side of midpoint
             mask = np.where(above_mid, 
                           0.5 + expanded_distance,  # Above midpoint: push toward 1.0
@@ -2086,7 +1868,6 @@ class PreviewImageQueue(SaveImage):
     """
     PreviewImage node with a queue button
     """
-    
     def __init__(self):
         self.output_dir = folder_paths.get_temp_directory()
         self.type = "temp"
@@ -2101,4 +1882,4 @@ class PreviewImageQueue(SaveImage):
                 }
 
     CATEGORY = "pirog/image"
-        
+    

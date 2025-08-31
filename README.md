@@ -36,9 +36,11 @@ Adds watermarks with different blend modes and positioning. Goes beyond basic ov
 ### 📸 DSLR Camera Noise
 **Category:** `pirog/image`
 
-Simulates real camera sensor noise based on actual physics. Not just random grain - this recreates the specific patterns you'd see from different camera models, ISO settings, and environmental conditions. 
+Simulates physically-accurate camera sensor noise. This isn't just a simple grain overlay; it's a sophisticated model that recreates the complex noise characteristics of digital cameras based on intuitive photographic controls.
 
-Perfect for making clean AI-generated images feel more authentic, or for adding that subtle imperfection that makes digital art feel organic. Each type of noise behaves differently: shot noise affects bright areas, read noise shows in shadows, thermal noise increases with temperature.
+Instead of tweaking a dozen abstract sliders, you control the noise through two main parameters: **ISO** and a **camera profile** (e.g., "Pro Full-Frame", "Smartphone", "Vintage DSLR"). The node then calculates the correct balance of different noise types—shot noise, read noise, thermal noise, and pattern noise—based on the selected profile and other physical parameters like sensor temperature and exposure time.
+
+The simulation correctly models how longer exposure times in dark scenes reduce photon shot noise while making thermal and read noise more prominent. The result is an authentic layer of detail that can make clean AI-generated images feel more like real photographs. It's perfect for adding subtle realism and organic texture.
 
 ### ✨ Lens-simulated Bloom
 **Category:** `pirog/image`
