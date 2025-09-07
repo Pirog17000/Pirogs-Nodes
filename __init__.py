@@ -1,5 +1,6 @@
 # Import enhanced KSampler classes from the node_modules package
 from .node_modules.samplermultiseed import KSamplerMultiSeed, KSamplerMultiSeedPlus
+from .node_modules.test_node import TestCollapsibleNode
 
 # Import other classes from the main nodes.py file
 from .nodes import StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue
@@ -23,7 +24,8 @@ NODE_CLASS_MAPPINGS = {
     "GradientMaskGenerator": GradientMaskGenerator,
     "ImageBlendByMask": ImageBlendByMask,
     "BlurByMask": BlurByMask,
-    "PreviewImageQueue": PreviewImageQueue
+    "PreviewImageQueue": PreviewImageQueue,
+    "TestCollapsibleNode": TestCollapsibleNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -45,7 +47,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GradientMaskGenerator": "Gradient Mask Generator",
     "ImageBlendByMask": "Image Blend by Mask",
     "BlurByMask": "Blur by Mask",
-    "PreviewImageQueue": "Preview Image (Queue)"
+    "PreviewImageQueue": "Preview Image (Queue)",
+    "TestCollapsibleNode": "Test Collapsible Node"
 }
 
 WEB_DIRECTORY = "./js"

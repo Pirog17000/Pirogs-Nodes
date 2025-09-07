@@ -12,16 +12,16 @@ Generates variations by stepping through seeds automatically. Instead of manuall
 ### 🎲 KSampler (Multi-Seed+)
 **Category:** `pirog/sampling`
 
-An all-in-one advanced sampler that combines multi-seed and batch processing with a powerful tiling system for working on large images. It seamlessly splits an image into tiles, processes each one as a separate inpainting task, and then blends them back together with gradient masks to create a flawless final image.
+An all-in-one advanced sampler that combines multi-seed and batch processing with a powerful tiling system and dynamic detail enhancement for working on large or complex images. It seamlessly splits an image into tiles, processes each one as a separate inpainting task, and then blends them back together to create a flawless final image.
 
 **Key Features:**
-- **Seamless Tiling:** Overcomes VRAM limitations by splitting large images into smaller tiles.
-- **Gradient Blending:** Uses percentage-based overlap with smooth gradient masks to eliminate visible seams between tiles.
+- **Tiled Processing:** A fixed and improved tiling system that overcomes VRAM limitations by splitting large images into smaller, manageable tiles. It now uses a weighted accumulation method with gradient masks for perfectly seamless blending, eliminating artifacts even with complex overlaps.
 - **Inpainting-Aware:** Each tile is treated as an inpainting task, ensuring that the content generated in the overlapping areas is contextually aware and blends perfectly.
+- **Detail Daemon:** A sophisticated detail enhancement system that gives you fine-grained control over the denoising process. You can define a schedule to increase or decrease detail at specific steps, adding sharpness and clarity exactly where you need it.
 - **Batch Processing:** Correctly handles batches of images, making it perfect for chaining multiple KSamplers.
 - **Advanced Noise:** Includes vanilla, spectral-diverse, and hierarchical noise generation for more creative control.
 
-This node is ideal for upscaling, outpainting, or high-resolution rendering where you need to process an image in sections without artifacts.
+This node is ideal for upscaling, outpainting, or high-resolution rendering where you need to process an image in sections without artifacts and with precise control over detail.
 
 ### 🔗 Combine strings
 **Category:** `pirog/text`

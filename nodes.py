@@ -337,11 +337,12 @@ class Watermark:
 
 class ImageScalePro:
     """
-    Professional Image Scaling Tool
+    Image Scaling Tool
     
     Advanced proportional image scaling with resolution limits, step alignment,
     and professional-grade controls. Features MX-style slider compatibility
-    for enhanced user experience.
+    for enhanced user experience. Includes selectable resampling methods with an
+    automatic mode that chooses the best filter for upscaling or downscaling.
     """
     
     @classmethod
@@ -355,6 +356,10 @@ class ImageScalePro:
                     "max": 10.0,
                     "step": 0.01,
                     "tooltip": "Scale factor - 1.0 = original size, 2.0 = double size, 0.5 = half size"
+                }),
+                "resampling_method": (["auto", "LANCZOS", "NEAREST", "BILINEAR", "BICUBIC"], {
+                    "default": "auto",
+                    "tooltip": "Resampling method. 'auto' selects NEAREST for upscaling, LANCZOS for downscaling."
                 }),
                 "resolution_step": ("INT", {
                     "default": 8,
@@ -388,9 +393,9 @@ class ImageScalePro:
     OUTPUT_TOOLTIPS = ("Scaled image(s) with proper aspect ratio preservation",)
     FUNCTION = "scale_image"
     CATEGORY = "pirog/transform"
-    DESCRIPTION = "Professional image scaling with proportional resize, resolution limits, and step alignment for optimal results."
+    DESCRIPTION = "Professional image scaling with proportional resize, resolution limits, step alignment, and selectable resampling methods for optimal results."
 
-    def scale_image(self, image, scale_multiplier, resolution_step, enable_limits, min_resolution, max_resolution):
+    def scale_image(self, image, scale_multiplier, resampling_method, resolution_step, enable_limits, min_resolution, max_resolution):
         logger = logging.getLogger(__name__)
         
         try:
@@ -398,6 +403,14 @@ class ImageScalePro:
 
             batch_size, height, width, channels = image.shape
             scaled_images = []
+
+            # Map string names to PIL resampling filters
+            resample_filters = {
+                "LANCZOS": Image.LANCZOS,
+                "NEAREST": Image.NEAREST,
+                "BILINEAR": Image.BILINEAR,
+                "BICUBIC": Image.BICUBIC,
+            }
 
             for i in range(batch_size):
                 pil_image = self.tensor_to_pil(image[i])
@@ -414,7 +427,16 @@ class ImageScalePro:
 
                 logger.info(f"Calculated new dimensions: {new_width}x{new_height}")
 
-                resized_image = pil_image.resize((new_width, new_height), Image.LANCZOS)
+                # Determine resampling method
+                if resampling_method == "auto":
+                    # Downscaling: LANCZOS is better. Upscaling: NEAREST is sharp and fast.
+                    resample_filter = Image.LANCZOS if scale_multiplier < 1.0 else Image.NEAREST
+                else:
+                    resample_filter = resample_filters.get(resampling_method, Image.LANCZOS)
+                
+                logger.info(f"Using resampling method: {resampling_method} -> {resample_filter}")
+
+                resized_image = pil_image.resize((new_width, new_height), resample_filter)
                 logger.info(f"Resized PIL Image size: {resized_image.size}")
 
                 scaled_images.append(self.tensor_to_pil_tensor(resized_image))
