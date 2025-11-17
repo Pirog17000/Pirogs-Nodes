@@ -1,0 +1,7 @@
+lmstudio
+requests
+Pillow
+numpy
+scipy
+torch
+opencv-python

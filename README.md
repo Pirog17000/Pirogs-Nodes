@@ -107,6 +107,13 @@ Preview node with integrated queue button. Click the button to execute just this
 
 Randomizes parts of your prompts using pattern replacement. Write `?color? ?animal? in ?background?` and it fills in the blanks from customizable dictionaries. Useful for generating variations or discovering unexpected combinations.
 
+### 🤖 LM Studio Query
+**Category:** `pirog/ai`
+
+Connects to LM Studio server for text generation and image analysis. Supports vision models for describing images, multi-seed prompt generation, and automatic model management. Can process image batches for detailed descriptions of different regions.
+
+**LM Studio Unload Model** - Companion node that properly unloads models from memory using the LM Studio SDK, with passthrough for maintaining workflow continuity.
+
 ## Why These Tools Matter
 
 This isn't just another random collection of nodes - it's about gathering all the missing pieces that make image generation workflows actually work smoothly. 
@@ -128,6 +135,7 @@ Built with clean architecture and proper error handling. Each node does one thin
 Pirogs-Nodes/
 ├── __init__.py              # Node mappings
 ├── nodes.py                 # Core node implementations
+├── requirements.txt          # Python dependencies
 ├── node_modules/            # Modularized nodes (e.g., KSamplers)
 ├── js/                      # Custom UI javascript (e.g., reset buttons)
 ├── README.md                # This file
@@ -136,7 +144,16 @@ Pirogs-Nodes/
 ```
 
 ### Dependencies
-Most nodes work with standard ComfyUI. The Lens-simulated Bloom requires NumPy, OpenCV, and SciPy for the advanced filtering operations.
+Most nodes work with standard ComfyUI. Some advanced features require additional packages:
+
+- **LM Studio Query nodes**: Requires `lmstudio` package for model unloading
+- **Lens-simulated Bloom**: Requires NumPy, OpenCV, and SciPy for advanced filtering
+- **General**: PyTorch, Pillow, requests for various operations
+
+Install all dependencies with:
+```bash
+pip install -r requirements.txt
+```
 
 ### Prompt Dictionary
 The randomizer creates a JSON file with common categories: colors, animals, styles, lighting, moods. You can edit it to add your own categories and terms.
@@ -147,7 +164,11 @@ Example patterns:
 
 ## Installation
 
-Drop the folder into your ComfyUI custom_nodes directory and restart. That's it.
+1. Drop the folder into your ComfyUI custom_nodes directory
+2. Install dependencies: `pip install -r requirements.txt`
+3. Restart ComfyUI
+
+That's it!
 
 ---
 
