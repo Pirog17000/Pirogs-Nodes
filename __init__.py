@@ -1,9 +1,8 @@
 # Import enhanced KSampler classes from the node_modules package
 from .node_modules.samplermultiseed import KSamplerMultiSeed, KSamplerMultiSeedPlus
-from .node_modules.test_node import TestCollapsibleNode
 
 # Import other classes from the main nodes.py file
-from .nodes import StringCombine, Watermark, ImageScalePro, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue
+from .nodes import StringCombine, Watermark, ImageScalePro, GetImageSize, PromptRandomizer, DSLRNoise, TestResetButton, LensSimulatedBloom, BlendImages, CropImage, BatchCropFromMaskSimple, BatchUncropSimple, CropMaskByBBox, BlurMask, InvertMask, GradientMaskGenerator, ImageBlendByMask, BlurByMask, PreviewImageQueue, LMStudioQuery, LMStudioUnloadModel, CLIPTextEncodeMultiple, CLIPTextEncodeFluxMultiple
 
 NODE_CLASS_MAPPINGS = {
     "KSamplerMultiSeed": KSamplerMultiSeed,
@@ -11,10 +10,12 @@ NODE_CLASS_MAPPINGS = {
     "StringCombine": StringCombine,
     "Watermark": Watermark,
     "ImageScalePro": ImageScalePro,
+    "GetImageSize": GetImageSize,
     "PromptRandomizer": PromptRandomizer,
     "DSLRNoise": DSLRNoise,
     "TestResetButton": TestResetButton,
     "LensSimulatedBloom": LensSimulatedBloom,
+    "BlendImages": BlendImages,
     "CropImage": CropImage,
     "BatchCropFromMaskSimple": BatchCropFromMaskSimple,
     "BatchUncropSimple": BatchUncropSimple,
@@ -25,7 +26,10 @@ NODE_CLASS_MAPPINGS = {
     "ImageBlendByMask": ImageBlendByMask,
     "BlurByMask": BlurByMask,
     "PreviewImageQueue": PreviewImageQueue,
-    "TestCollapsibleNode": TestCollapsibleNode
+    "LMStudioQuery": LMStudioQuery,
+    "LMStudioUnloadModel": LMStudioUnloadModel,
+    "CLIPTextEncodeMultiple": CLIPTextEncodeMultiple,
+    "CLIPTextEncodeFluxMultiple": CLIPTextEncodeFluxMultiple
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -34,10 +38,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StringCombine": "Combine strings",
     "Watermark": "Watermark",
     "ImageScalePro": "Proportional Image Scaling",
+    "GetImageSize": "Get Image Size",
     "PromptRandomizer": "Prompt Randomizer",
     "DSLRNoise": "DSLR Camera Noise",
     "TestResetButton": "Test Reset Button",
     "LensSimulatedBloom": "Lens-simulated Bloom",
+    "BlendImages": "Blend Images",
     "CropImage": "Crop Image Sides",
     "BatchCropFromMaskSimple": "Crop From Mask",
     "BatchUncropSimple": "Uncrop Image",
@@ -48,7 +54,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageBlendByMask": "Image Blend by Mask",
     "BlurByMask": "Blur by Mask",
     "PreviewImageQueue": "Preview Image (Queue)",
-    "TestCollapsibleNode": "Test Collapsible Node"
+    "LMStudioQuery": "LM Studio Query",
+    "LMStudioUnloadModel": "LM Studio Unload Model",
+    "CLIPTextEncodeMultiple": "CLIP Text Encode (Multiple)",
+    "CLIPTextEncodeFluxMultiple": "CLIP Text Encode Flux (Multiple)"
 }
 
 WEB_DIRECTORY = "./js"

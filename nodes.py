@@ -15,9 +15,22 @@ import importlib.util
 import numpy as np
 from PIL import Image, ImageChops, ImageOps
 from scipy.ndimage import gaussian_filter
+import requests
+import base64
+from io import BytesIO
+from urllib.parse import urlparse
+from .utilities import tensor_to_pil, pil_to_tensor, srgb_to_linear, linear_to_srgb, apply_noise_blur, tensor_to_numpy, numpy_to_tensor, safe_poisson
 
-# Import our advanced noise generation library
-# from .noise_generator import create_spectral_diverse_noise, create_hierarchical_noise
+# Try to import LM Studio SDK for model unloading
+try:
+    import lmstudio
+    LMSTUDIO_SDK_AVAILABLE = True
+except ImportError:
+    LMSTUDIO_SDK_AVAILABLE = False
+    print("LM Studio SDK not available. Model unloading will not work. Install with: pip install lmstudio")
+
+logger = logging.getLogger(__name__)
+
 
 # Add the ComfyUI root directory to Python path to access the main nodes
 comfy_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -162,61 +175,34 @@ class Watermark:
             logger.info(f"Input image tensor shape: {image.shape}")
             logger.info(f"Input watermark tensor shape: {watermark.shape}")
 
-            # Ensure tensors are in (B, C, H, W) format
+            # Ensure tensors are in BHWC format (ComfyUI standard)
             if image.dim() == 3:
                 image = image.unsqueeze(0)
-            if image.shape[1] != 3 and image.shape[1] != 4:
-                image = image.permute(0, 3, 1, 2)
-            
+            # ComfyUI tensors are already in BHWC format, no permute needed
+
             if watermark.dim() == 3:
                 watermark = watermark.unsqueeze(0)
-            if watermark.shape[1] != 3 and watermark.shape[1] != 4:
-                watermark = watermark.permute(0, 3, 1, 2)
+            # ComfyUI tensors are already in BHWC format, no permute needed
 
-            batch_size, channels, height, width = image.shape
+            batch_size, height, width, channels = image.shape
             processed_images = []
 
             for i in range(batch_size):
-                img_pil = self.tensor_to_pil(image[i])
-                watermark_pil = self.tensor_to_pil(watermark[0] if watermark.shape[0] > 1 else watermark)
-                
-                result = self.process_single_image(img_pil, watermark_pil, scale, opacity, blend_mode, position, invert_watermark, use_black_mask, logger)
-                processed_images.append(self.pil_to_tensor(result))
+                img_pil = tensor_to_pil(image[i])
+                watermark_pil = tensor_to_pil(watermark[0] if watermark.shape[0] > 1 else watermark)
 
-            # Stack processed images and return
-            result = torch.stack(processed_images)
-            
-            # Ensure the output is in the format expected by ComfyUI (B, H, W, C)
-            result = result.permute(0, 2, 3, 1)
+                result = self.process_single_image(img_pil, watermark_pil, scale, opacity, blend_mode, position, invert_watermark, use_black_mask, logger)
+                processed_images.append(pil_to_tensor(result))
+
+            # Concatenate processed images along the batch dimension
+            result = torch.cat(processed_images, dim=0)
+            # Result is already in BHWC format as expected by ComfyUI
             
             return (result,)
         except Exception as e:
             logger.error(f"Error in watermark application: {str(e)}")
             return (image,)  # Return original image in case of error
 
-    def tensor_to_pil(self, tensor):
-        tensor = tensor.cpu().float()
-        if tensor.dim() == 4 and tensor.shape[0] == 1:
-            tensor = tensor.squeeze(0)
-        if tensor.dim() != 3:
-            raise ValueError(f"Expected 3 dimensions (C,H,W), got tensor with shape {tensor.shape}")
-        tensor = tensor.clamp(0, 1)
-        array = (tensor.permute(1, 2, 0).numpy() * 255).astype('uint8')
-        if array.shape[2] == 1:
-            return Image.fromarray(array.squeeze(), mode='L')
-        elif array.shape[2] == 3:
-            return Image.fromarray(array, mode='RGB')
-        elif array.shape[2] == 4:
-            return Image.fromarray(array, mode='RGBA')
-        else:
-            raise ValueError(f"Unexpected number of channels: {array.shape[2]}")
-
-    def pil_to_tensor(self, pil_image):
-        np_image = np.array(pil_image).astype(np.float32) / 255.0
-        if len(np_image.shape) == 2:
-            np_image = np_image[..., np.newaxis]
-        tensor = torch.from_numpy(np_image).permute(2, 0, 1)
-        return tensor
 
     def process_single_image(self, image, watermark, scale, opacity, blend_mode, position, invert_watermark, use_black_mask, logger):
         watermark, mask = self.prepare_watermark(watermark, scale, invert_watermark, use_black_mask, logger)
@@ -389,8 +375,9 @@ class ImageScalePro:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    OUTPUT_TOOLTIPS = ("Scaled image(s) with proper aspect ratio preservation",)
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("scaled_image", "width", "height")
+    OUTPUT_TOOLTIPS = ("Scaled image(s) with proper aspect ratio preservation", "Width of scaled image", "Height of scaled image")
     FUNCTION = "scale_image"
     CATEGORY = "pirog/transform"
     DESCRIPTION = "Professional image scaling with proportional resize, resolution limits, step alignment, and selectable resampling methods for optimal results."
@@ -413,7 +400,7 @@ class ImageScalePro:
             }
 
             for i in range(batch_size):
-                pil_image = self.tensor_to_pil(image[i])
+                pil_image = tensor_to_pil(image[i])
                 logger.info(f"Original PIL Image size: {pil_image.size}")
 
                 new_width = int(width * scale_multiplier)
@@ -439,36 +426,18 @@ class ImageScalePro:
                 resized_image = pil_image.resize((new_width, new_height), resample_filter)
                 logger.info(f"Resized PIL Image size: {resized_image.size}")
 
-                scaled_images.append(self.tensor_to_pil_tensor(resized_image))
+                scaled_images.append(pil_to_tensor(resized_image))
 
             output_tensor = torch.cat(scaled_images, dim=0)
             logger.info(f"Output tensor shape: {output_tensor.shape}")
 
-            return (output_tensor,)
+            return (output_tensor, new_width, new_height)
 
         except Exception as e:
             logger.error(f"Error in scale_image: {str(e)}")
             logger.error(f"Input tensor shape: {image.shape}, dtype: {image.dtype}")
-            return (image,)
+            return (image, width, height)
 
-    def tensor_to_pil(self, tensor):
-        tensor = tensor.cpu().float()
-        tensor = torch.clamp(tensor, 0, 1)
-        array = (tensor * 255).byte().numpy()
-        
-        if array.shape[-1] == 3:
-            return Image.fromarray(array, mode='RGB')
-        elif array.shape[-1] == 4:
-            return Image.fromarray(array, mode='RGBA')
-        else:
-            raise ValueError(f"Unsupported number of channels: {array.shape[-1]}")
-
-    def tensor_to_pil_tensor(self, pil_image):
-        np_image = np.array(pil_image).astype(np.float32) / 255.0
-        tensor = torch.from_numpy(np_image).float()
-        if tensor.dim() == 3:
-            tensor = tensor.unsqueeze(0)
-        return tensor
 
     def apply_resolution_limits(self, width, height, min_resolution, max_resolution):
         longest_side = max(width, height)
@@ -483,6 +452,47 @@ class ImageScalePro:
         new_height = int(height * scale_factor)
 
         return new_width, new_height
+
+
+class GetImageSize:
+    """
+    Get Image Dimensions
+
+    Extracts width and height dimensions from an image tensor.
+    Returns integer values for width and height.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", {"tooltip": "Input image to get dimensions from"})
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("width", "height")
+    OUTPUT_TOOLTIPS = ("Width of the image", "Height of the image")
+    FUNCTION = "get_size"
+    CATEGORY = "pirog/utility"
+    DESCRIPTION = "Extract width and height dimensions from an image."
+
+    def get_size(self, image):
+        """
+        Extract width and height from image tensor.
+
+        Args:
+            image: Image tensor in ComfyUI format, can be BHWC or HWC
+
+        Returns:
+            tuple: (width, height) as integers
+        """
+        # Image tensor shape is either (batch_size, height, width, channels) or (height, width, channels).
+        # We can reliably get height and width from the second and third last dimensions.
+        height = image.shape[-3]
+        width = image.shape[-2]
+
+        return (width, height)
 
 
 class PromptRandomizer:
@@ -520,22 +530,24 @@ class PromptRandomizer:
                 "clean_text": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Apply text cleaning (remove extra spaces, fix punctuation, convert anime terms)."
+                }),
+                "prompts_count": ("INT", {
+                    "default": 1, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "Number of randomized prompts to generate. Useful for batch processing with samplers that support multiple prompts."
                 })
             }
         }
 
     RETURN_TYPES = ("STRING", "STRING", "INT")
-    RETURN_NAMES = ("modified_prompt", "selections", "used_seed")
+    RETURN_NAMES = ("modified_prompts", "selections", "used_seed")
     FUNCTION = "randomize_prompt"
     CATEGORY = "pirog/text"
-    DESCRIPTION = "Randomizes text prompts using pattern replacement with dictionary support, validation, and flexible text processing options."
+    DESCRIPTION = "Randomizes text prompts using pattern replacement with dictionary support, validation, and flexible text processing options. Can generate multiple prompts for batch processing."
 
-    def randomize_prompt(self, prompt, dictionary_filename, seed, preserve_newlines, clean_text):
-        all_selections = []
-        
-        # Set the seed
-        used_seed = seed if seed != -1 else random.randint(0, 0xffffffffffffffff)
-        random.seed(used_seed)
+    def randomize_prompt(self, prompt, dictionary_filename, seed, preserve_newlines, clean_text, prompts_count):
+        # Handle input processing - convert arrays to strings if needed
+        if isinstance(prompt, list):
+            prompt = " ".join(str(x) for x in prompt)
 
         # Get dictionary path relative to this node pack
         dictionary_path = self.get_dictionary_path(dictionary_filename)
@@ -543,47 +555,67 @@ class PromptRandomizer:
         # Load or create the dictionary
         random_dictionary = self.load_or_create_dictionary(dictionary_path)
 
-        # Process randomization
-        for i in range(10):  # Max 10 iterations to prevent infinite loops
-            # Find all tags in the prompt string
-            tags = re.findall(r"\?\s*[^\?]+\s*\?", prompt)
-            
-            if not tags:  # No more tags to process
-                break
+        generated_prompts = []
+        all_selections_list = []
 
-            for tag in tags:
-                # Get the options
-                options = tag[1:-1].split("|")
-                options = [option.strip() for option in options]
+        # Generate multiple prompts with different seeds
+        for prompt_idx in range(prompts_count):
+            # Set the seed for this prompt (increment from base seed)
+            current_seed = seed + prompt_idx if seed != -1 else random.randint(0, 0xffffffffffffffff) + prompt_idx
+            random.seed(current_seed)
 
-                # Choose a random option
-                random_option = random.choice(options)
+            # Work on a copy of the original prompt
+            current_prompt = prompt
+            current_selections = []
 
-                # If the option is in the dictionary, use a random word from that category
-                # Otherwise, use the option as-is
-                if random_option in random_dictionary and random_dictionary[random_option]:
-                    word = random.choice(random_dictionary[random_option])
-                else:
-                    word = random_option
+            # Process randomization for this prompt
+            for i in range(10):  # Max 10 iterations to prevent infinite loops
+                # Find all tags in the prompt string
+                tags = re.findall(r"\?\s*[^\?]+\s*\?", current_prompt)
 
-                # Replace the tag with the chosen word
-                prompt = prompt.replace(tag, word, 1)
+                if not tags:  # No more tags to process
+                    break
 
-                # Add only non-empty selections to array for later display
-                if word and word.strip():
-                    all_selections.append(word.strip())
+                for tag in tags:
+                    # Get the options
+                    options = tag[1:-1].split("|")
+                    options = [option.strip() for option in options]
 
-        # Join selections into a single string
-        selections_string = ", ".join(all_selections)
-        
-        # Apply text processing based on settings
-        if clean_text:
-            prompt = self.clean_prompt(prompt)
-        
-        if not preserve_newlines:
-            prompt = self.remove_newlines(prompt)
+                    # Choose a random option
+                    random_option = random.choice(options)
 
-        return (prompt, selections_string, used_seed)
+                    # If the option is in the dictionary, use a random word from that category
+                    # Otherwise, use the option as-is
+                    if random_option in random_dictionary and random_dictionary[random_option]:
+                        word = random.choice(random_dictionary[random_option])
+                    else:
+                        word = random_option
+
+                    # Replace the tag with the chosen word
+                    current_prompt = current_prompt.replace(tag, word, 1)
+
+                    # Add only non-empty selections to array for later display
+                    if word and word.strip():
+                        current_selections.append(word.strip())
+
+            # Apply text processing based on settings
+            if clean_text:
+                current_prompt = self.clean_prompt(current_prompt)
+
+            if not preserve_newlines:
+                current_prompt = self.remove_newlines(current_prompt)
+
+            generated_prompts.append(current_prompt)
+            all_selections_list.append(", ".join(current_selections))
+
+        # Use the first seed as the "used_seed" for compatibility
+        used_seed = seed if seed != -1 else random.randint(0, 0xffffffffffffffff)
+
+        # Return single prompt/string when count=1, list when count>1
+        if prompts_count == 1:
+            return (generated_prompts[0], all_selections_list[0], used_seed)
+        else:
+            return (generated_prompts, all_selections_list, used_seed)
 
     def get_dictionary_path(self, filename):
         # Get the directory where this node pack is located
@@ -728,25 +760,6 @@ CAMERA_PROFILES = {
 }
 
 
-def srgb_to_linear(img):
-    """Converts sRGB image data to linear RGB."""
-    mask = img <= 0.04045
-    return np.where(mask, img / 12.92, ((img + 0.055) / 1.055) ** 2.4)
-
-def linear_to_srgb(img):
-    """Converts linear RGB image data to sRGB."""
-    mask = img <= 0.0031308
-    srgb = np.where(mask, img * 12.92, 1.055 * (img ** (1.0 / 2.4)) - 0.055)
-    return np.clip(srgb, 0.0, 1.0)
-
-def apply_noise_blur(noise, blur_sigma):
-    """Applies a Gaussian blur to the generated noise field."""
-    if blur_sigma > 0:
-        for c in range(noise.shape[2]):
-            noise[:, :, c] = gaussian_filter(noise[:, :, c], sigma=blur_sigma)
-    return noise
-
-
 class DSLRNoise(ComfyNodeABC):
     """
     DSLR Camera Noise Simulation Node
@@ -840,7 +853,7 @@ class DSLRNoise(ComfyNodeABC):
             # 2. Shot Noise (Pre-gain)
             # We now use the scaled signal to calculate shot noise. The original signal is used
             # later to preserve the image's actual brightness.
-            shot_noise_e = np.random.poisson(np.maximum(scaled_signal_for_noise_calc, 0)) - scaled_signal_for_noise_calc
+            shot_noise_e = safe_poisson(np.maximum(scaled_signal_for_noise_calc, 0)) - scaled_signal_for_noise_calc
 
             # 3. Thermal Noise (Dark Current & DSNU) (Pre-gain)
             # This part correctly uses exposure_time already, so no changes are needed.
@@ -848,7 +861,7 @@ class DSLRNoise(ComfyNodeABC):
             dark_current_e = params["dark_current_base"] * temp_factor * exposure_time
             dsnu_pattern = np.random.normal(1.0, params["dsnu_factor"], current_signal_e.shape)
             dark_current_with_dsnu = dark_current_e * dsnu_pattern
-            thermal_noise_e = np.random.poisson(np.maximum(dark_current_with_dsnu, 0)) - dark_current_with_dsnu
+            thermal_noise_e = safe_poisson(np.maximum(dark_current_with_dsnu, 0)) - dark_current_with_dsnu
 
             # 4. ISO Gain and Read Noise (Post-gain)
             gain = max(iso / 100.0, 1.0)
@@ -856,9 +869,15 @@ class DSLRNoise(ComfyNodeABC):
 
             base_luma_noise = np.random.normal(0, read_noise_std, (height, width, 1))
 
-            chroma_h, chroma_w = height // 2, width // 2
+            # Create low-resolution chroma noise and upsample to match image dimensions
+            chroma_h, chroma_w = max(1, height // 2), max(1, width // 2)
             lowres_chroma_noise = np.random.normal(0, read_noise_std, (chroma_h, chroma_w, channels))
-            chroma_noise = np.repeat(np.repeat(lowres_chroma_noise, 2, axis=0), 2, axis=1)
+
+            # Upsample by repeating, ensuring we get at least the target dimensions
+            repeat_h = int(np.ceil(height / chroma_h))
+            repeat_w = int(np.ceil(width / chroma_w))
+            chroma_noise = np.repeat(np.repeat(lowres_chroma_noise, repeat_h, axis=0), repeat_w, axis=1)
+            # Crop to exact dimensions
             chroma_noise = chroma_noise[:height, :width, :]
 
             chroma_factor = params["chroma_noise_factor"]
@@ -945,304 +964,104 @@ class LensSimulatedBloom:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE", {
-                    "tooltip": "Input image to apply lens-simulated bloom effect"
-                }),
-                "psf_kernel": ("IMAGE", {
-                    "tooltip": "Point Spread Function kernel defining diffraction spike shape (grayscale recommended)"
-                }),
+                "image": ("IMAGE",),
                 "threshold": ("FLOAT", {
-                    "default": 0.85,
+                    "default": 0.8, 
+                    "min": 0.0, 
+                    "max": 1.0, 
+                    "step": 0.01,
+                    "tooltip": "Luminosity threshold to isolate highlights (0.0-1.0)"
+                }),
+                "iterations": ("INT", {
+                    "default": 4, 
+                    "min": 1, 
+                    "max": 16, 
+                    "step": 1,
+                    "tooltip": "Number of blur layers to generate"
+                }),
+                "amount": ("FLOAT", {
+                    "default": 10.0, 
+                    "min": 0.1, 
+                    "max": 100.0, 
+                    "step": 0.1,
+                    "tooltip": "Initial blur strength, which is halved for each subsequent iteration"
+                }),
+                "opacity": ("FLOAT", {
+                    "default": 1.0,
                     "min": 0.0,
                     "max": 1.0,
                     "step": 0.01,
-                    "tooltip": "Base brightness threshold (0.0-1.0). With progressive_threshold enabled, this is the starting threshold that increases each pass up to 1.0"
-                }),
-                "haze_passes": ("INT", {
-                    "default": 6,
-                    "min": 1,
-                    "max": 12,
-                    "step": 1,
-                    "tooltip": "Number of downsampling/blurring passes for soft haze effect"
-                }),
-                "haze_spread": ("FLOAT", {
-                    "default": 2.0,
-                    "min": 0.1,
-                    "max": 10.0,
-                    "step": 0.1,
-                    "tooltip": "Gaussian blur sigma for haze passes - controls haze softness"
-                }),
-                "haze_intensity": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.0,
-                    "max": 10.0,
-                    "step": 0.01,
-                    "tooltip": "Multiplier for soft haze brightness (normalized, safe range 0.1-3.0)"
-                }),
-                "spike_intensity": ("FLOAT", {
-                    "default": 1.5,
-                    "min": 0.0,
-                    "max": 10.0,
-                    "step": 0.01,
-                    "tooltip": "Multiplier for structured spike brightness (normalized, safe range 0.1-5.0)"
-                }),
-                "progressive_threshold": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Enable progressive threshold: each haze pass uses higher threshold for finer detail isolation"
+                    "tooltip": "Opacity of the bloom effect. 0.0 is original image, 1.0 is full bloom."
                 })
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
-    OUTPUT_TOOLTIPS = ("Image with lens-simulated bloom effect applied",)
     FUNCTION = "apply_bloom"
-    CATEGORY = "pirog/image"
-    DESCRIPTION = "Applies realistic lens bloom using hybrid approach: multi-pass blur for soft haze + FFT convolution for sharp spikes. Requires NumPy, OpenCV, and SciPy."
+    CATEGORY = "Pirog/image"
+    DESCRIPTION = "Applies a bloom effect based on a Photoshop workflow using luminosity masking and layer blending."
 
-    def apply_bloom(self, image, psf_kernel, threshold, haze_passes, haze_spread, haze_intensity, spike_intensity, progressive_threshold=True):
-        """Apply the hybrid bloom effect to input images"""
+    def apply_bloom(self, image, threshold, iterations, amount, opacity):
+        """Apply the bloom effect to input images"""
         try:
-            # Import required libraries
             import cv2
-            
-            # Convert ComfyUI tensors to numpy arrays
-            img_np = self.tensor_to_numpy(image)
-            kernel_np = self.tensor_to_numpy(psf_kernel)
-            
-            # Process each image in the batch
-            batch_size = img_np.shape[0]
-            output_images = []
-            
-            for i in range(batch_size):
-                # Get single image and convert to proper format
-                single_img = img_np[i]
-                
-                # Use first kernel image or cycle through if multiple kernels
-                kernel_idx = min(i, kernel_np.shape[0] - 1)
-                single_kernel = kernel_np[kernel_idx]
-                
-                # Convert kernel to grayscale if it's color
-                if len(single_kernel.shape) == 3:
-                    single_kernel = cv2.cvtColor(single_kernel, cv2.COLOR_RGB2GRAY)
-                
-                # Apply the hybrid bloom effect
-                bloom_result = self.apply_hybrid_bloom(
-                    single_img,
-                    single_kernel,
-                    threshold,
-                    haze_passes,
-                    haze_spread,
-                    haze_intensity,
-                    spike_intensity,
-                    progressive_threshold
-                )
-                
-                output_images.append(bloom_result)
-            
-            # Stack results and convert back to tensor
-            result_array = np.stack(output_images, axis=0)
-            result_tensor = self.numpy_to_tensor(result_array)
-            
-            return (result_tensor,)
-            
-        except ImportError as e:
-            raise RuntimeError(f"Missing required library for Lens-simulated Bloom: {e}. Please install numpy, opencv-python, and scipy.")
-        except Exception as e:
-            raise RuntimeError(f"Error applying lens bloom: {e}")
+            import numpy as np
 
-    def apply_hybrid_bloom(self, image, psf_kernel, threshold=0.85, haze_passes=6, 
-                          haze_spread=2.0, haze_intensity=1.0, spike_intensity=1.5, progressive_threshold=True):
-        """
-        Applies a high-quality, hybrid bloom effect to an input image.
+        except ImportError:
+            raise RuntimeError("Missing required libraries for Bloom node. Please install numpy and opencv-python.")
 
-        This method combines two techniques for a visually superior result:
-        1.  A multi-pass, downsampling blur (the "Haze") for a soft, atmospheric glow.
-            Progressive threshold mode creates realistic gradation from general to specific highlights
-        2.  An FFT convolution with a custom kernel (the "Spikes") for sharp,
-            structured diffraction artifacts like starbursts or anamorphic streaks.
+        img_np_in = tensor_to_numpy(image)
+
+        output_images = []
+        for single_img_in in img_np_in:
             
-        Args:
-            progressive_threshold (bool): When True, each haze pass uses progressively higher 
-                threshold values (e.g., 0.2 → 0.36 → 0.52 → ... → 1.0), creating more 
-                realistic bloom with fine gradation. When False, uses original single-threshold method.
-        """
-        import numpy as np
-        import cv2
-        from scipy.signal import fftconvolve
-
-        # --- 1. PRE-PROCESSING AND BRIGHTNESS EXTRACTION ---
-
-        # Ensure image is in a floating-point format (0.0 to 1.0) for calculations
-        if image.dtype == np.uint8:
-            image_float = image.astype(np.float32) / 255.0
-        else:
-            image_float = image.copy()
-
-        # Create a brightness map. For color images, convert to grayscale.
-        # The brightness map determines which pixels are bright enough to "bloom".
-        if len(image_float.shape) == 3:
-            brightness_map = cv2.cvtColor(image_float, cv2.COLOR_RGB2GRAY)
-        else:
-            brightness_map = image_float
-
-        # --- 2. HAZE GENERATION (PROGRESSIVE THRESHOLD MULTI-PASS BLUR) ---
-
-        if progressive_threshold:
-            # Progressive threshold mode: each pass uses increasingly higher threshold
-            # This creates more realistic bloom with fine gradation from general to specific highlights
+            img_uint8 = (single_img_in * 255).astype(np.uint8)
             
-            # Calculate threshold progression from base threshold to 1.0
-            if haze_passes > 1:
-                threshold_step = (1.0 - threshold) / (haze_passes - 1)
-                thresholds = [threshold + i * threshold_step for i in range(haze_passes)]
-            else:
-                thresholds = [threshold]
+            lab_image = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
             
-            # Create haze layers with progressive thresholds
-            haze_layers = []
-            for pass_idx in range(haze_passes):
-                current_threshold = thresholds[pass_idx]
-                
-                # Threshold the brightness map for this pass
-                _, brights_mask = cv2.threshold(brightness_map, current_threshold, 1.0, cv2.THRESH_BINARY)
-                
-                # Create bright pixels for this threshold level
-                if len(image_float.shape) == 3:
-                    brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
-                    bright_pixels_pass = image_float * brights_mask_3ch
+            l_channel = lab_image[:,:,0]
+            
+            threshold_value = threshold * 255
+            
+            _, mask = cv2.threshold(l_channel, threshold_value, 255, cv2.THRESH_BINARY)
+            
+            mask_3d = (np.expand_dims(mask, axis=2) > 0).astype(float)
+            
+            processing_canvas = single_img_in * mask_3d
+            
+            blurred_layers = []
+            current_blur_amount = amount
+            for _ in range(iterations):
+                if current_blur_amount > 0:
+                    # Kernel size must be an odd number, derived from sigma (amount)
+                    ksize = int(current_blur_amount * 3) 
+                    if ksize % 2 == 0:
+                        ksize += 1
+                    
+                    blurred_layer = cv2.GaussianBlur(processing_canvas, (ksize, ksize), current_blur_amount)
+                    blurred_layers.append(blurred_layer)
                 else:
-                    bright_pixels_pass = brights_mask
+                    blurred_layers.append(processing_canvas.copy())
                 
-                # Downsample for pyramid effect
-                current_layer = bright_pixels_pass
-                for _ in range(pass_idx):
-                    current_layer = cv2.pyrDown(current_layer)
+                current_blur_amount /= 2.0
+            
+            bloom_result_image = single_img_in.copy()
+            
+            for blurred_layer in blurred_layers:
+                bloom_result_image = np.maximum(bloom_result_image, blurred_layer)
+
+            # Blend with original image based on opacity
+            final_image = (single_img_in * (1.0 - opacity)) + (bloom_result_image * opacity)
                 
-                haze_layers.append(current_layer)
+            final_image = np.clip(final_image, 0.0, 1.0)
             
-            # Blur each threshold layer with appropriate scaling
-            blurred_layers = [cv2.GaussianBlur(layer, (0, 0), haze_spread) for layer in haze_layers]
-            
-            # Composite progressive threshold layers
-            haze_composite = None
-            for i, layer in enumerate(blurred_layers):
-                # Upsample to original size using safer approach
-                upsampled = layer
-                
-                # Instead of forcing pyrUp to exact dimensions, use step-by-step upsampling
-                # then resize to exact dimensions at the end
-                for _ in range(i):
-                    # Use pyrUp without forcing exact dimensions
-                    upsampled = cv2.pyrUp(upsampled)
-                
-                # Now safely resize to exact original dimensions
-                if upsampled.shape[:2] != image_float.shape[:2]:
-                    upsampled = cv2.resize(upsampled, (image_float.shape[1], image_float.shape[0]))
-                
-                if haze_composite is None:
-                    haze_composite = upsampled
-                else:
-                    haze_composite += upsampled
-            
-        else:
-            # Original single-threshold mode for compatibility
-            _, brights_mask = cv2.threshold(brightness_map, threshold, 1.0, cv2.THRESH_BINARY)
-            
-            if len(image_float.shape) == 3:
-                brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
-                bright_pixels = image_float * brights_mask_3ch
-            else:
-                bright_pixels = brights_mask
-            
-            haze_layers = [bright_pixels]
-            current_layer = bright_pixels
-            
-            # Create a pyramid of downsampled images
-            for _ in range(haze_passes - 1):
-                current_layer = cv2.pyrDown(current_layer)
-                haze_layers.append(current_layer)
-            
-            # Blur each layer in the pyramid
-            blurred_layers = [cv2.GaussianBlur(layer, (0, 0), haze_spread) for layer in haze_layers]
-            
-            # Composite the blurred layers back together
-            haze_composite = blurred_layers[-1]
-            for i in range(haze_passes - 2, -1, -1):
-                # Use pyrUp without forcing exact dimensions, then resize if needed
-                haze_composite = cv2.pyrUp(haze_composite)
-                
-                # Ensure dimensions match the target layer
-                if haze_composite.shape[:2] != blurred_layers[i].shape[:2]:
-                    haze_composite = cv2.resize(haze_composite, (blurred_layers[i].shape[1], blurred_layers[i].shape[0]))
-                
-                haze_composite += blurred_layers[i]
+            output_images.append(final_image)
+
+        result_array = np.stack(output_images, axis=0)
+        result_tensor = numpy_to_tensor(result_array)
         
-        # Normalize by the number of layers to prevent brightness accumulation
-        # This ensures haze_intensity behaves predictably regardless of haze_passes
-        haze_composite = haze_composite / haze_passes
+        return (result_tensor,)
 
-        # For spike generation, use the original threshold method to maintain compatibility
-        _, brights_mask = cv2.threshold(brightness_map, threshold, 1.0, cv2.THRESH_BINARY)
-        if len(image_float.shape) == 3:
-            brights_mask_3ch = cv2.cvtColor(brights_mask, cv2.COLOR_GRAY2RGB)
-            bright_pixels = image_float * brights_mask_3ch
-        else:
-            bright_pixels = brights_mask
-
-        # --- 3. SPIKE GENERATION (FFT CONVOLUTION) ---
-
-        # Normalize the PSF kernel to prevent value explosion during convolution
-        # This ensures the convolution output stays in a reasonable range
-        psf_normalized = psf_kernel / np.sum(psf_kernel) if np.sum(psf_kernel) > 0 else psf_kernel
-
-        # Convolve the bright pixels with the custom PSF kernel using FFT for efficiency
-        # and accuracy. This creates the structured light spikes.
-        if len(image_float.shape) == 3:
-            spike_layer = np.zeros_like(image_float)
-            # Perform convolution on each color channel separately
-            for i in range(3):
-                spike_layer[:, :, i] = fftconvolve(bright_pixels[:, :, i], psf_normalized, mode='same')
-        else:
-            spike_layer = fftconvolve(bright_pixels, psf_normalized, mode='same')
-
-        # --- 4. FINAL COMPOSITION ---
-
-        # Combine the original image, the soft haze, and the sharp spikes.
-        # The intensities are used to control the final look.
-        bloom_image = (
-            image_float +
-            (haze_composite * haze_intensity) +
-            (spike_layer * spike_intensity)
-        )
-
-        # Clip the result to the valid [0.0, 1.0] range to prevent wrapping artifacts
-        bloom_image = np.clip(bloom_image, 0.0, 1.0)
-
-        # Convert back to uint8 format for standard image display/saving
-        return (bloom_image * 255).astype(np.uint8)
-
-    def tensor_to_numpy(self, tensor):
-        """Convert ComfyUI image tensor to numpy array"""
-        # ComfyUI tensors are in format [batch, height, width, channels]
-        # Convert to uint8 if in float format
-        if tensor.dtype == torch.float32 or tensor.dtype == torch.float64:
-            # Clamp to [0,1] and convert to [0,255]
-            numpy_array = (torch.clamp(tensor, 0, 1) * 255).byte().cpu().numpy()
-        else:
-            numpy_array = tensor.cpu().numpy()
-        
-        return numpy_array
-
-    def numpy_to_tensor(self, numpy_array):
-        """Convert numpy array to ComfyUI image tensor"""
-        # Ensure array is in uint8 format
-        if numpy_array.dtype != np.uint8:
-            numpy_array = np.clip(numpy_array, 0, 255).astype(np.uint8)
-        
-        # Convert to float32 and normalize to [0,1]
-        tensor = torch.from_numpy(numpy_array.astype(np.float32) / 255.0)
-        
-        return tensor
 
 
 # ====================================
@@ -1904,4 +1723,942 @@ class PreviewImageQueue(SaveImage):
                 }
 
     CATEGORY = "pirog/image"
-    
+
+
+class LMStudioQuery(ComfyNodeABC):
+    """
+    LM Studio Query Node
+
+    Universal node for querying LM Studio server with text and optional image inputs.
+    Supports model loading/unloading, multi-prompt generation with different seeds,
+    and batch processing of images for descriptions.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "system_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "You are a helpful assistant.",
+                    "tooltip": "System prompt to set the AI's behavior and role"
+                }),
+                "user_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "Describe this image in detail.",
+                    "tooltip": "User prompt for the query. Use with images for descriptions or standalone for text generation."
+                }),
+                "model_name": ("STRING", {
+                    "default": "",
+                    "tooltip": "Model name or partial name to search for. Leave empty to use currently loaded model."
+                }),
+                "server_url": ("STRING", {
+                    "default": "http://localhost:1234",
+                    "tooltip": "LM Studio server URL"
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Sampling temperature (0.0 = deterministic, 2.0 = very random)"
+                }),
+                "max_tokens": ("INT", {
+                    "default": 256, "min": 1, "max": 4096, "step": 1,
+                    "tooltip": "Maximum number of tokens to generate"
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling parameter"
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff,
+                    "tooltip": "Random seed for reproducible results. 0 = random each time."
+                }),
+                "prompts_number": ("INT", {
+                    "default": 1, "min": 1, "max": 10, "step": 1,
+                    "tooltip": "Number of prompts to generate with different seeds"
+                }),
+                "unload_after_use": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Unload the model after processing to free memory"
+                }),
+            },
+            "optional": {
+                "images": ("IMAGE", {"tooltip": "Optional images for visual queries (batch processing supported)"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("generated_texts", "model_ref")
+    OUTPUT_TOOLTIPS = ("Array of generated text responses", "Reference to the loaded model name")
+    FUNCTION = "query_lm_studio"
+    CATEGORY = "pirog/ai"
+    DESCRIPTION = "Query LM Studio for text generation with optional image input, model management, and multi-seed prompt generation."
+
+    def query_lm_studio(self, system_prompt, user_prompt, model_name, server_url, temperature, max_tokens, top_p, seed, prompts_number, unload_after_use, images=None):
+        logger = logging.getLogger(__name__)
+
+        # Handle input processing - convert arrays to strings if needed
+        if isinstance(system_prompt, list):
+            system_prompt = " ".join(str(x) for x in system_prompt)
+        if isinstance(user_prompt, list):
+            user_prompt = " ".join(str(x) for x in user_prompt)
+
+        try:
+            # Get models list and check server in one request
+            models_data = self._get_models_and_check_server(server_url)
+            if not models_data:
+                raise RuntimeError(f"Cannot connect to LM Studio server at {server_url} or no models available")
+
+            models = models_data['models']
+            loaded_model_name = models_data.get('loaded_model')
+
+            # Determine which model to use
+            if model_name:
+                # User specified a model - find it or use loaded one
+                target_model = self._find_model(model_name, models)
+                if not target_model:
+                    raise RuntimeError(f"Model '{model_name}' not found in available models")
+                # Use the target model name for API calls
+                api_model = target_model
+            else:
+                # No specific model - use currently loaded
+                if not loaded_model_name:
+                    raise RuntimeError("No model specified and no model currently loaded")
+                api_model = loaded_model_name
+
+            # Prepare images if provided
+            image_data_list = []
+            if images is not None:
+                for i in range(images.shape[0]):
+                    img_pil = self._tensor_to_pil(images[i])
+                    if img_pil is None:
+                        raise RuntimeError(f"Failed to convert image {i} to PIL")
+                    img_base64 = self._pil_to_base64(img_pil)
+                    image_data_list.append(img_base64)
+
+            # Generate prompts
+            generated_texts = []
+            for prompt_idx in range(prompts_number):
+                current_seed = seed + prompt_idx if seed != 0 else random.randint(0, 0xffffffffffffffff)
+
+                if image_data_list:
+                    # Process each image with the current seed
+                    for img_base64 in image_data_list:
+                        response = self._send_vision_query(
+                            server_url, system_prompt, user_prompt, img_base64,
+                            temperature, max_tokens, top_p, current_seed, api_model
+                        )
+                        generated_texts.append(response)
+                else:
+                    # Text-only query
+                    response = self._send_text_query(
+                        server_url, system_prompt, user_prompt,
+                        temperature, max_tokens, top_p, current_seed, api_model
+                    )
+                    generated_texts.append(response)
+
+            # Unload model if requested (optional, since LM Studio may auto-manage)
+            if unload_after_use and api_model:
+                self._unload_model(server_url, api_model)
+
+            return (generated_texts, api_model)
+
+        except Exception as e:
+            logger.error(f"Error in LM Studio query: {str(e)}")
+            return ([f"Error: {str(e)}"], "")
+
+    def _get_models_and_check_server(self, server_url):
+        """Get models list and check server connectivity in one fast request"""
+        try:
+            response = requests.get(f"{server_url}/v1/models", timeout=2)  # Fast timeout
+            if response.status_code == 200:
+                data = response.json()
+                models = [model['id'] for model in data.get('data', [])]
+                loaded_model = None
+                for model in data.get('data', []):
+                    if model.get('loaded', False):
+                        loaded_model = model['id']
+                        break
+                return {'models': models, 'loaded_model': loaded_model}
+        except Exception as e:
+            logging.warning(f"Failed to get models: {e}")
+        return None
+
+    def _find_model(self, model_name, available_models):
+        """Find model by name (exact or partial match)"""
+        # Find exact match first
+        for model in available_models:
+            if model == model_name:
+                return model
+
+        # Find partial match
+        for model in available_models:
+            if model_name.lower() in model.lower():
+                return model
+
+        return None
+
+    def _load_model(self, server_url, model_name):
+        """Load a model on LM Studio"""
+        try:
+            response = requests.post(
+                f"{server_url}/v1/models/load",
+                json={"model": model_name},
+                timeout=60  # Model loading can take time
+            )
+            if response.status_code == 200:
+                return model_name
+        except Exception as e:
+            logging.error(f"Failed to load model {model_name}: {e}")
+        return None
+
+    def _unload_model(self, server_url, model_name):
+        """Unload a model from LM Studio using SDK only"""
+        if not LMSTUDIO_SDK_AVAILABLE:
+            print(f"Cannot unload model {model_name}: LM Studio SDK not available. Install with: pip install lmstudio")
+            return False
+
+        try:
+            # Extract host and port from server_url (remove http:// prefix)
+            parsed_url = urlparse(server_url)
+            api_host = f"{parsed_url.hostname}:{parsed_url.port}"
+
+            # Use SDK for proper unloading - direct unload by model key (recommended approach)
+            client = lmstudio.Client(api_host=api_host)
+            client.llm.unload(model_name)
+            print(f"Successfully unloaded model via SDK: {model_name}")
+            return True
+        except Exception as e:
+            print(f"SDK unload failed for {model_name}: {e}")
+            return False
+
+    def _tensor_to_pil(self, tensor):
+        """Convert ComfyUI tensor to PIL Image"""
+        tensor = tensor.cpu().float()
+
+        if tensor.dim() == 4 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+
+        if tensor.dim() == 3 and tensor.shape[2] in [1, 3, 4]:  # RGB/RGBA image (H, W, C)
+            tensor = torch.clamp(tensor, 0, 1)
+            array = (tensor.numpy() * 255).astype('uint8')  # Already (H, W, C)
+            if array.shape[2] == 1:
+                return Image.fromarray(array.squeeze(axis=2), mode='L')
+            elif array.shape[2] == 3:
+                return Image.fromarray(array, mode='RGB')
+            elif array.shape[2] == 4:
+                return Image.fromarray(array, mode='RGBA')
+        elif tensor.dim() == 2:  # Grayscale mask (H, W)
+            tensor = torch.clamp(tensor, 0, 1)
+            array = (tensor.numpy() * 255).astype('uint8')
+            return Image.fromarray(array, mode='L')
+        else:
+            raise ValueError(f"Unsupported tensor shape: {tensor.shape}, dim: {tensor.dim()}")
+
+    def _pil_to_base64(self, pil_image):
+        """Convert PIL Image to base64 string"""
+        if pil_image is None:
+            raise ValueError("PIL image is None")
+        buffer = BytesIO()
+        # Try JPEG first, fallback to PNG if needed
+        try:
+            pil_image.save(buffer, format='JPEG', quality=95)
+        except Exception:
+            buffer = BytesIO()
+            pil_image.save(buffer, format='PNG')
+        return base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+    def _sanitize_text_output(self, text):
+        """Sanitize LLM output to escape unsafe characters for ComfyUI processing"""
+        if not isinstance(text, str):
+            return text
+
+        # Escape backslashes first (must be done before other replacements)
+        text = text.replace('\\', '\\\\')
+
+        # Escape parentheses that can break CLIP tokenization
+        text = text.replace('(', '\\(').replace(')', '\\)')
+
+        # Escape brackets that can cause parsing issues
+        text = text.replace('[', '\\[').replace(']', '\\]')
+
+        # Escape curly braces
+        text = text.replace('{', '\\{').replace('}', '\\}')
+
+        # Escape quotes that might break string processing
+        text = text.replace('"', '\\"').replace("'", "\\'")
+
+        # Convert newlines to spaces with separator
+        text = text.replace('\n', ' -- ')
+
+        # Remove control characters and non-printable characters (but keep spaces and tabs)
+        text = ''.join(char for char in text if ord(char) >= 32 or char in ' \t\n')
+
+        # Clean up multiple spaces
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        return text
+
+    def _send_text_query(self, server_url, system_prompt, user_prompt, temperature, max_tokens, top_p, seed, model):
+        """Send text-only query to LM Studio"""
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "seed": seed,
+            "stream": False
+        }
+
+        response = requests.post(f"{server_url}/v1/chat/completions", json=payload, timeout=120)
+        if response.status_code == 200:
+            data = response.json()
+            content = data['choices'][0]['message']['content']
+            return self._sanitize_text_output(content)
+        else:
+            raise RuntimeError(f"Query failed: {response.status_code} - {response.text}")
+
+    def _send_vision_query(self, server_url, system_prompt, user_prompt, image_base64, temperature, max_tokens, top_p, seed, model):
+        """Send vision query with image to LM Studio"""
+        # Try OpenAI-compatible format first
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
+                        }
+                    ]
+                }
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "seed": seed,
+            "stream": False
+        }
+
+        response = requests.post(f"{server_url}/v1/chat/completions", json=payload, timeout=120)
+        if response.status_code == 200:
+            data = response.json()
+            content = data['choices'][0]['message']['content']
+            return self._sanitize_text_output(content)
+        else:
+            # Try alternative format if OpenAI format fails
+            logging.warning(f"OpenAI format failed, trying alternative. Status: {response.status_code}")
+            alt_payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "images": [image_base64],  # Alternative format
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": top_p,
+                "seed": seed,
+                "stream": False
+            }
+
+            response = requests.post(f"{server_url}/v1/chat/completions", json=alt_payload, timeout=120)
+            if response.status_code == 200:
+                data = response.json()
+                content = data['choices'][0]['message']['content']
+                return self._sanitize_text_output(content)
+            else:
+                raise RuntimeError(f"Vision query failed: {response.status_code} - {response.text}")
+
+
+class CLIPTextEncodeMultiple(ComfyNodeABC):
+    """
+    CLIP Text Encode Multiple Node
+
+    Encodes multiple text prompts using a CLIP model into conditioning embeddings.
+    Takes a list of strings and returns a list of CONDITIONING for batch processing.
+    Useful for tile-based workflows where each tile needs its own prompt.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP", {"tooltip": "The CLIP model used for encoding the text."}),
+                "texts": ("STRING", {"tooltip": "List of text prompts to encode. Each text will be encoded separately."}),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    OUTPUT_TOOLTIPS = ("List of conditioning embeddings, one for each input text.",)
+    FUNCTION = "encode_multiple"
+    CATEGORY = "conditioning"
+    DESCRIPTION = "Encodes multiple text prompts into conditioning embeddings for batch processing workflows."
+
+    def encode_multiple(self, clip, texts):
+        if clip is None:
+            raise RuntimeError("ERROR: clip input is invalid: None\n\nIf the clip is from a checkpoint loader node your checkpoint does not contain a valid clip or text encoder model.")
+
+        # Ensure texts is a list
+        if isinstance(texts, str):
+            # Try to parse string as list (e.g., "['text1', 'text2']")
+            try:
+                import ast
+                parsed = ast.literal_eval(texts)
+                if isinstance(parsed, list):
+                    texts = parsed
+                else:
+                    texts = [texts]
+            except (ValueError, SyntaxError):
+                texts = [texts]
+        elif not isinstance(texts, list):
+            texts = [str(texts)]
+
+        conditionings = []
+        for text in texts:
+            if isinstance(text, str) and text.strip():
+                tokens = clip.tokenize(text)
+                conditioning = clip.encode_from_tokens_scheduled(tokens)
+                conditionings.append(conditioning)
+
+        # Return as a list of conditionings for tile processing
+        return (conditionings,)
+
+
+class CLIPTextEncodeFluxMultiple(ComfyNodeABC):
+    """
+    CLIP Text Encode Flux Multiple Node
+
+    Encodes multiple text prompt pairs using a CLIP model into conditioning embeddings for Flux models.
+    Takes lists of strings for clip_l and t5xxl and returns a list of CONDITIONING for batch processing.
+    Useful for tile-based workflows where each tile needs its own prompt pair.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "clip": ("CLIP", {"tooltip": "The CLIP model used for encoding the text."}),
+                "clip_l_texts": ("STRING", {"tooltip": "List of CLIP-L text prompts to encode. Each text will be encoded separately."}),
+                "t5xxl_texts": ("STRING", {"tooltip": "List of T5-XXL text prompts to encode. Each text will be paired with corresponding clip_l_texts."}),
+                "guidance": ("FLOAT", {"default": 3.5, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Guidance scale for Flux models."}),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    OUTPUT_TOOLTIPS = ("List of conditioning embeddings, one for each input text pair.",)
+    FUNCTION = "encode_flux_multiple"
+    CATEGORY = "advanced/conditioning/flux"
+    DESCRIPTION = "Encodes multiple text prompt pairs into conditioning embeddings for Flux models in batch processing workflows."
+
+    def encode_flux_multiple(self, clip, clip_l_texts, t5xxl_texts, guidance):
+        if clip is None:
+            raise RuntimeError("ERROR: clip input is invalid: None\n\nIf the clip is from a checkpoint loader node your checkpoint does not contain a valid clip or text encoder model.")
+
+        # Ensure inputs are lists
+        def parse_input(input_val):
+            if isinstance(input_val, str):
+                # Try to parse string as list (e.g., "['text1', 'text2']")
+                try:
+                    import ast
+                    parsed = ast.literal_eval(input_val)
+                    if isinstance(parsed, list):
+                        return parsed
+                    else:
+                        return [input_val]
+                except (ValueError, SyntaxError):
+                    return [input_val]
+            elif not isinstance(input_val, list):
+                return [str(input_val)]
+            return input_val
+
+        clip_l_texts = parse_input(clip_l_texts)
+        t5xxl_texts = parse_input(t5xxl_texts)
+
+        # Ensure both lists have the same length
+        max_len = max(len(clip_l_texts), len(t5xxl_texts))
+        if len(clip_l_texts) < max_len:
+            clip_l_texts.extend([clip_l_texts[-1]] * (max_len - len(clip_l_texts)))
+        if len(t5xxl_texts) < max_len:
+            t5xxl_texts.extend([t5xxl_texts[-1]] * (max_len - len(t5xxl_texts)))
+
+        conditionings = []
+        for clip_l_text, t5xxl_text in zip(clip_l_texts, t5xxl_texts):
+            if isinstance(clip_l_text, str) and isinstance(t5xxl_text, str) and (clip_l_text.strip() or t5xxl_text.strip()):
+                tokens = clip.tokenize(clip_l_text)
+                tokens["t5xxl"] = clip.tokenize(t5xxl_text)["t5xxl"]
+                conditioning = clip.encode_from_tokens_scheduled(tokens, add_dict={"guidance": guidance})
+                conditionings.append(conditioning)
+
+        # Return as a list of conditionings for tile processing
+        return (conditionings,)
+
+
+class BatchLoadImages(ComfyNodeABC):
+    """
+    Batch Load Images Node
+
+    Loads all images from specified directory.
+    Supports JPG, PNG, WEBP formats.
+    Returns image batch and corresponding filenames.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "directory_path": ("STRING", {
+                    "default": "./input_images",
+                    "tooltip": "Path to directory containing images to load"
+                }),
+                "recursive": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Search recursively in subdirectories"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "filenames")
+    OUTPUT_TOOLTIPS = ("Batch of loaded images", "List of corresponding filenames")
+    FUNCTION = "load_images"
+    CATEGORY = "pirog/image"
+    DESCRIPTION = "Loads all JPG, PNG, WEBP images from specified directory. Returns image batch and filename list for batch processing."
+
+    def load_images(self, directory_path, recursive):
+        """Load all supported images from directory"""
+        import os
+        from PIL import Image
+
+        supported_formats = ('.jpg', '.jpeg', '.png', '.webp')
+        images = []
+        filenames = []
+
+        try:
+            # Normalize path
+            directory_path = os.path.expanduser(directory_path)
+
+            if recursive:
+                # Recursive search
+                for root, dirs, files in os.walk(directory_path):
+                    for file in files:
+                        if file.lower().endswith(supported_formats):
+                            full_path = os.path.join(root, file)
+                            try:
+                                # Load image
+                                pil_image = Image.open(full_path)
+                                # Convert to RGB if needed
+                                if pil_image.mode != 'RGB':
+                                    pil_image = pil_image.convert('RGB')
+
+                                # Convert to tensor
+                                img_tensor = pil_to_tensor(pil_image)
+                                images.append(img_tensor)
+                                filenames.append(file)
+                            except Exception as e:
+                                print(f"Error loading {full_path}: {e}")
+                                continue
+            else:
+                # Non-recursive search
+                if os.path.exists(directory_path):
+                    for file in os.listdir(directory_path):
+                        if file.lower().endswith(supported_formats):
+                            full_path = os.path.join(directory_path, file)
+                            try:
+                                # Load image
+                                pil_image = Image.open(full_path)
+                                # Convert to RGB if needed
+                                if pil_image.mode != 'RGB':
+                                    pil_image = pil_image.convert('RGB')
+
+                                # Convert to tensor
+                                img_tensor = pil_to_tensor(pil_image)
+                                images.append(img_tensor)
+                                filenames.append(file)
+                            except Exception as e:
+                                print(f"Error loading {full_path}: {e}")
+                                continue
+
+            if not images:
+                raise RuntimeError(f"No supported images found in directory: {directory_path}")
+
+            # Stack images into batch
+            image_batch = torch.stack(images)
+
+            return (image_batch, filenames)
+
+        except Exception as e:
+            raise RuntimeError(f"Error loading images from {directory_path}: {e}")
+
+
+
+class BatchSaveImages(ComfyNodeABC):
+    """
+    Batch Save Images Node
+
+    Saves batch of images with optional auto-renaming.
+    Supports multiple formats and custom output directory.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "Batch of images to save"
+                }),
+                "filenames": ("STRING", {
+                    "tooltip": "List of filenames (used when auto_rename is False)"
+                }),
+                "output_directory": ("STRING", {
+                    "default": "./output_images",
+                    "tooltip": "Directory to save images to"
+                }),
+                "auto_rename": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Auto-generate filenames in format 0001_filename.jpg (ignores input filenames)"
+                }),
+                "base_filename": ("STRING", {
+                    "default": "image",
+                    "tooltip": "Base name for auto-generated filenames (only used when auto_rename is True)"
+                }),
+                "format": (["jpg", "png", "webp"], {
+                    "default": "jpg",
+                    "tooltip": "Output image format"
+                }),
+                "quality": ("INT", {
+                    "default": 95,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Image quality (for JPG/WEBP formats)"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("saved_paths")
+    OUTPUT_TOOLTIPS = ("List of paths where images were saved",)
+    FUNCTION = "save_images"
+    CATEGORY = "pirog/image"
+    DESCRIPTION = "Saves batch of images with auto-renaming option. Generates filenames like 0001_basename.jpg or uses provided filenames. Supports JPG, PNG, WEBP formats."
+
+    def save_images(self, images, filenames, output_directory, auto_rename, base_filename, format, quality):
+        """Save batch of images to disk"""
+        import os
+        from PIL import Image
+
+        saved_paths = []
+
+        try:
+            # Create output directory if it doesn't exist
+            os.makedirs(output_directory, exist_ok=True)
+
+            # Ensure filenames is a list
+            if isinstance(filenames, str):
+                # If single string, create list with one element
+                filenames = [filenames] * images.shape[0]
+            elif not isinstance(filenames, list):
+                filenames = [str(filenames)] * images.shape[0]
+
+            # Ensure we have enough filenames
+            while len(filenames) < images.shape[0]:
+                filenames.append(f"image_{len(filenames)}")
+
+            batch_size = images.shape[0]
+
+            for i in range(batch_size):
+                try:
+                    # Get image tensor
+                    img_tensor = images[i]
+
+                    # Convert to PIL
+                    pil_image = tensor_to_pil(img_tensor)
+
+                    # Generate filename
+                    if auto_rename:
+                        # Format: 0001_basename.jpg
+                        filename = "04d"
+                        if base_filename:
+                            filename = f"{filename}_{base_filename}"
+                        filename = f"{filename}.{format}"
+                    else:
+                        # Use provided filename but change extension
+                        original_name = filenames[i] if i < len(filenames) else f"image_{i}"
+                        # Remove extension and add new one
+                        name_without_ext = os.path.splitext(original_name)[0]
+                        filename = f"{name_without_ext}.{format}"
+
+                    # Full path
+                    full_path = os.path.join(output_directory, filename)
+
+                    # Save with appropriate format settings
+                    if format.lower() == "jpg":
+                        pil_image.save(full_path, "JPEG", quality=quality)
+                    elif format.lower() == "png":
+                        pil_image.save(full_path, "PNG")
+                    elif format.lower() == "webp":
+                        pil_image.save(full_path, "WEBP", quality=quality)
+
+                    saved_paths.append(full_path)
+                    print(f"Saved image to: {full_path}")
+
+                except Exception as e:
+                    print(f"Error saving image {i}: {e}")
+                    continue
+
+            return (saved_paths,)
+
+        except Exception as e:
+            raise RuntimeError(f"Error saving images: {e}")
+
+
+
+class BlendImages(ComfyNodeABC):
+    """
+    Blend Images Node
+
+    Blends two images using various blend modes supported by PIL.
+    Provides full control over blend amount and supports all major blend modes.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image1": ("IMAGE", {"tooltip": "First image to blend"}),
+                "image2": ("IMAGE", {"tooltip": "Second image to blend"}),
+                "blend_amount": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Opacity control: 0.0 = original image, 1.0 = full blend effect. For normal mode: blends between image1/image2 directly."
+                }),
+                "blend_mode": ([
+                    "normal", "add", "subtract", "multiply", "screen",
+                    "overlay", "soft_light", "hard_light", "color_dodge",
+                    "color_burn", "lighten", "darken", "difference"
+                ], {"tooltip": "Blend mode to use for combining the images"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_TOOLTIPS = ("Blended image result",)
+    FUNCTION = "blend_images"
+    CATEGORY = "pirog/image"
+    DESCRIPTION = "Blends two images using various PIL-supported blend modes. Blend amount controls opacity: 0.0 = original image, 1.0 = full blend effect. Normal mode blends directly between input images."
+
+    def blend_images(self, image1, image2, blend_amount, blend_mode):
+        """Blend two images using the specified blend mode and amount"""
+        try:
+            # Ensure tensors are on the same device
+            device = image1.device
+            image2 = image2.to(device)
+
+            # Handle batch processing - use the maximum batch size
+            batch_size = max(image1.shape[0], image2.shape[0])
+            results = []
+
+            for i in range(batch_size):
+                # Cycle through batches if sizes differ
+                img1_idx = i % image1.shape[0]
+                img2_idx = i % image2.shape[0]
+
+                # Convert tensors to PIL images
+                pil_img1 = tensor_to_pil(image1[img1_idx])
+                pil_img2 = tensor_to_pil(image2[img2_idx])
+
+                # Ensure images are the same size
+                if pil_img1.size != pil_img2.size:
+                    # Resize image2 to match image1
+                    pil_img2 = pil_img2.resize(pil_img1.size, Image.LANCZOS)
+
+                # Ensure both images are in RGB mode
+                if pil_img1.mode != 'RGB':
+                    pil_img1 = pil_img1.convert('RGB')
+                if pil_img2.mode != 'RGB':
+                    pil_img2 = pil_img2.convert('RGB')
+
+                # Apply the blend mode
+                if blend_mode == "normal":
+                    # Simple alpha blending between image1 and image2
+                    blended = Image.blend(pil_img1, pil_img2, blend_amount)
+                else:
+                    # For non-normal modes: compute full blend result C, then blend between A and C
+                    full_blend_result = self._apply_blend_mode(pil_img1, pil_img2, blend_mode)
+                    # blend_amount controls opacity between original image1 (A) and full blend result (C)
+                    blended = Image.blend(pil_img1, full_blend_result, blend_amount)
+
+                # Convert back to tensor
+                result_tensor = pil_to_tensor(blended)
+                results.append(result_tensor)
+
+            # Concatenate results along the batch dimension
+            final_result = torch.cat(results, dim=0)
+            return (final_result,)
+
+        except Exception as e:
+            logger.error(f"Error in blend_images: {str(e)}")
+            # Return first image as fallback
+            return (image1,)
+
+    def _apply_blend_mode(self, img1, img2, mode):
+        """Apply specific blend mode using ImageChops"""
+        if mode == "add":
+            return ImageChops.add(img1, img2, scale=1.0, offset=0)
+        elif mode == "subtract":
+            return ImageChops.subtract(img1, img2, scale=1.0, offset=0)
+        elif mode == "multiply":
+            return ImageChops.multiply(img1, img2)
+        elif mode == "screen":
+            # Screen blend: 1 - (1-a)(1-b)
+            return ImageChops.screen(img1, img2)
+        elif mode == "overlay":
+            return ImageChops.overlay(img1, img2)
+        elif mode == "soft_light":
+            return ImageChops.soft_light(img1, img2)
+        elif mode == "hard_light":
+            return ImageChops.hard_light(img1, img2)
+        elif mode == "color_dodge":
+            return ImageChops.add(img1, img2, scale=1.0, offset=0)  # Approximation
+        elif mode == "color_burn":
+            return ImageChops.subtract(img1, img2, scale=1.0, offset=0)  # Approximation
+        elif mode == "lighten":
+            return ImageChops.lighter(img1, img2)
+        elif mode == "darken":
+            return ImageChops.darker(img1, img2)
+        elif mode == "difference":
+            return ImageChops.difference(img1, img2)
+        else:
+            # Fallback to normal blend
+            return Image.blend(img1, img2, 0.5)
+
+
+class IfNode(ComfyNodeABC):
+    """
+    IF Node
+
+    Conditional node that returns one of two inputs based on boolean condition.
+    Supports any data type for true/false inputs.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "condition": ("BOOLEAN", {
+                    "tooltip": "Boolean condition - True returns input_true, False returns input_false"
+                }),
+                "input_true": ("*", {
+                    "tooltip": "Value to return when condition is True"
+                }),
+                "input_false": ("*", {
+                    "tooltip": "Value to return when condition is False"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("*",)
+    OUTPUT_TOOLTIPS = ("The selected input based on condition",)
+    FUNCTION = "execute"
+    CATEGORY = "pirog/logic"
+    DESCRIPTION = "Conditional node that selects between two inputs based on boolean condition. Returns input_true if condition is True, input_false if condition is False."
+
+    def execute(self, condition, input_true, input_false):
+        """Execute conditional logic"""
+        if condition:
+            return (input_true,)
+        else:
+            return (input_false,)
+
+
+class LMStudioUnloadModel(ComfyNodeABC):
+    """
+    LM Studio Unload Model Node
+
+    Companion node to unload models from LM Studio memory.
+    Takes model reference and unloads the model, with passthrough for text and images.
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_ref": ("STRING", {
+                    "tooltip": "Reference to the model name to unload from LM Studio"
+                }),
+                "server_url": ("STRING", {
+                    "default": "http://localhost:1234",
+                    "tooltip": "LM Studio server URL"
+                }),
+            },
+            "optional": {
+                "system_prompt": ("STRING", {"tooltip": "Passthrough for system prompt"}),
+                "user_prompt": ("STRING", {"tooltip": "Passthrough for user prompt"}),
+                "images": ("IMAGE", {"tooltip": "Passthrough for images"}),
+                "generated_texts": ("STRING", {"tooltip": "Passthrough for generated texts"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE", "STRING")
+    RETURN_NAMES = ("system_prompt", "user_prompt", "images", "generated_texts")
+    OUTPUT_TOOLTIPS = ("Passthrough system prompt", "Passthrough user prompt", "Passthrough images", "Passthrough generated texts")
+    FUNCTION = "unload_model"
+    CATEGORY = "pirog/ai"
+    DESCRIPTION = "Unload a model from LM Studio memory with passthrough for text and images to maintain chain connectivity."
+
+    def unload_model(self, model_ref, server_url, system_prompt="", user_prompt="", images=None, generated_texts=""):
+
+        try:
+            if not model_ref:
+                logger.warning("No model reference provided for unloading")
+                return (system_prompt, user_prompt, images, generated_texts)
+
+            # Try to unload the model using SDK
+            success = self._unload_model(server_url, model_ref)
+            if success:
+                logger.info(f"Successfully unloaded model: {model_ref}")
+            else:
+                logger.warning(f"Failed to unload model: {model_ref} (SDK not available or model not found)")
+
+            # Return passthrough values
+            return (system_prompt, user_prompt, images, generated_texts)
+
+        except Exception as e:
+            logger.error(f"Error unloading model: {str(e)}")
+            return (system_prompt, user_prompt, images, generated_texts)
+
+    def _check_server(self, server_url):
+        """Check if LM Studio server is running"""
+        try:
+            response = requests.get(f"{server_url}/v1/models", timeout=2)
+            return response.status_code == 200
+        except:
+            return False
+
+    def _unload_model(self, server_url, model_name):
+        """Unload a model from LM Studio using SDK only"""
+        if not LMSTUDIO_SDK_AVAILABLE:
+            logger.error(f"Cannot unload model {model_name}: LM Studio SDK not available. Install with: pip install lmstudio")
+            return False
+
+        try:
+            # Extract host and port from server_url (remove http:// prefix)
+            parsed_url = urlparse(server_url)
+            api_host = f"{parsed_url.hostname}:{parsed_url.port}"
+
+            # Use SDK for proper unloading - direct unload by model key (recommended approach)
+            client = lmstudio.Client(api_host=api_host)
+            client.llm.unload(model_name)
+            logger.info(f"Successfully unloaded model via SDK: {model_name}")
+            return True
+        except Exception as e:
+            logger.error(f"SDK unload failed for {model_name}: {e}")
+            return False
